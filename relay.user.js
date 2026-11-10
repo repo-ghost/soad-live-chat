@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IG Direct → Live Mirror Relay (read-only)
 // @namespace    https://github.com/orin/soad-live-chat
-// @version      2.3.0
+// @version      2.4.0
 // @description  Mirrors ONE Instagram Direct thread to Firebase Realtime Database for a public read-only page. Client-side DOM observation only — no login automation, no private APIs. Mobile (Firefox for Android) friendly.
 // @author       Orin
 // @downloadURL  https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js
@@ -94,7 +94,7 @@
     SCROLL_STEP_RATIO: 0.85,     // how much of the viewport to scroll per step
     SCROLL_SETTLE_MS: 420,       // wait for lazy-loaded rows after each step
     SCROLL_TOP_GRACE: 5,         // extra passes at the top before believing we arrived
-    MAX_BACKFILL_MS: 240000,     // hard stop (4 min) so it can never loop forever
+    MAX_BACKFILL_MS: 90000,      // hard stop (90 s) for the whole history read
 
     // Small status pill in the corner (tap it to open diagnostics).
     SHOW_HUD: true,
@@ -107,7 +107,7 @@
    * 2. INTERNALS
    * =================================================================================== */
 
-  const VERSION = '2.3.0';
+  const VERSION = '2.4.0';
   const DB = String(CONFIG.FIREBASE_DB_URL).replace(/\/+$/, '');
   const LOG = (...a) => console.log('%c[relay]', 'color:#A800FF;font-weight:700', ...a);
   const WARN = (...a) => console.warn('%c[relay]', 'color:#ff9f0a;font-weight:700', ...a);
@@ -293,9 +293,14 @@
       }
 
       hud('📜 Reading the whole history…');
+      window.__relayWatchdog = makeWatchdog(() => {
+        hud('⚠️ History read stalled · DB left untouched', 'bad');
+        STATE.lastError = 'watchdog: read made no progress for ' + (READ_STALL_MS / 1000) + 's';
+      });
       const all = await backfillAll((collected) => {
         hud('📜 Reading history… ' + collected + ' messages');
       });
+      window.__relayWatchdog = null;
 
       if (!all || !all.length) {
         STATE.lastError = 'backfill returned nothing';
@@ -1784,13 +1789,17 @@
   }
 
   async function nudgeForMore(scroller) {
-    for (let i = 1; i <= 3; i++) {
+    const before = scroller.scrollHeight + ':' + countMessageish(scroller);
+    for (let i = 1; i <= 2; i++) {
       scroller.scrollTop = Math.round(60 * i);       // move down a bit
       await sleepScroll(120);
       scroller.scrollTop = 0;                        // slam back to the top
-      await sleepScroll(380);
-      if (scroller.scrollHeight > 0) return;
+      fireScrollHints(scroller, -1);
+      await sleepScroll(320);
+      // stop as soon as the loader answered — no point burning two more rounds
+      if (scroller.scrollHeight + ':' + countMessageish(scroller) !== before) return true;
     }
+    return false;
   }
 
   /**
@@ -2001,9 +2010,14 @@
     let idleAtTop = 0;
     let lastHeight = useScroller.scrollHeight;
     let steps = 0;
+    let stallNoMove = 0;
 
     while (nowMs() - started < CONFIG.MAX_BACKFILL_MS) {
       if (document.hidden) { WARN('backfill paused: tab hidden'); break; }
+      if (window.__relayWatchdog && window.__relayWatchdog.check()) {
+        WARN('backfill watchdog: read made no progress');
+        break;
+      }
 
       const before = useScroller.scrollTop;
       const step = Math.max(140, Math.floor(useScroller.clientHeight * CONFIG.SCROLL_STEP_RATIO));
@@ -2014,6 +2028,7 @@
       steps++;
 
       let fresh = harvestNew(seen, useScroller);
+      if (window.__relayWatchdog) window.__relayWatchdog.beat();
       if (fresh.length) collected = fresh.concat(collected);   // ← true chronological order
       trace('up step', steps, 'top=' + Math.round(useScroller.scrollTop),
             'h=' + useScroller.scrollHeight, 'fresh=' + fresh.length, 'total=' + collected.length);
@@ -2026,6 +2041,18 @@
       if (onProgress) onProgress(collected.length, steps, useScroller.scrollTop);
       trace('   top=' + Math.round(useScroller.scrollTop), 'h=' + heightBefore,
             'grew=' + grew, 'fresh=' + fresh.length, 'idle=' + idleAtTop);
+
+      // Stall guard: Instagram sometimes stops changing scrollTop (rubber-banding,
+      // a modal, an overlay). Without this the loop simply spins until the outer
+      // time limit and looks like a hang.
+      if (!fresh.length && !grew) {
+        if (++stallNoMove >= 6) {
+          WARN('backfill: scroll position stopped moving — stopping here');
+          break;
+        }
+      } else {
+        stallNoMove = 0;
+      }
 
       // Still walking upward — keep going.
       if (!atZero) { idleAtTop = 0; continue; }
@@ -2057,53 +2084,19 @@
       await sleepScroll(250);
     }
 
-    // ── Phase 2: canonical order pass ────────────────────────────────────────
-    // Everything is loaded now. Scroll to the very top, then step DOWN, appending
-    // each newly-seen bubble in DOM order. This yields guaranteed chat order
-    // without relying on coordinates recorded during the upward pass.
-    useScroller.scrollTop = 0;
-    await sleepScroll(CONFIG.SCROLL_SETTLE_MS + 150);
-
-    const ordered = [];
-    const seenElements = new WeakSet();   // DOM identity — each bubble counted once
-    let guard = 0;
-
-    // harvest the top window first
-    const takePass = () => {
-      const { bubbles } = getBubbles();          // already sorted top→bottom
-      let added = 0;
-      for (const b of bubbles) {
-        if (seenElements.has(b)) continue;       // same DOM node → already recorded
-        let item;
-        try { item = extractRow(b); } catch (_) { continue; }
-        if (isJunkItem(item)) continue;
-        if (!item.text && item.kind === 'text') continue;
-        seenElements.add(b);
-        item.offsetKey = Math.round(b.getBoundingClientRect().top - useScroller.getBoundingClientRect().top);
-        ordered.push(item);
-        added++;
-      }
-      return added;
-    };
-
-    takePass();
-
-    while (guard++ < 600) {
-      const max = useScroller.scrollHeight - useScroller.clientHeight;
-      if (useScroller.scrollTop >= max - 2) { takePass(); break; }
-      const step = Math.max(140, Math.floor(useScroller.clientHeight * 0.7));
-      useScroller.scrollTop = Math.min(max, useScroller.scrollTop + step);
-      await sleepScroll(Math.max(160, CONFIG.SCROLL_SETTLE_MS - 140));
-      takePass();
-    }
-
+    // ── Order ────────────────────────────────────────────────────────────────
+    // `collected` holds every SIGHTING of every message (the same bubble is seen
+    // on several upward steps), so it must be collapsed by signature — keeping at
+    // most `maxPerSig` copies, since "ok" can legitimately be sent twice.
+    // `collected` was built by PREPENDING each step, so it is already in chat
+    // order oldest → newest. (An older version also ran a second full top→bottom
+    // pass here to rebuild that order; on a long thread that doubled the work and
+    // looked like a hang.)
+    const finalList = dedupeOrdered(collected, seen.maxPerSig);
     useScroller.scrollTop = origTop > 0 ? origTop : useScroller.scrollHeight;
 
-    // collapse exact repeats while preserving order (a message genuinely sent
-    // twice appears twice in `ordered`, which is correct)
-    const finalList = dedupeSequential(ordered);
-    LOG('backfill canonical order:', finalList.length, 'messages (scan steps', steps + ')');
-    trace('canonical=' + finalList.length + ' harvested=' + ordered.length);
+    LOG('backfill order:', finalList.length, 'messages (steps', steps + ')');
+    trace('collected=' + collected.length + ' final=' + finalList.length);
     return finalList;
   }
 
@@ -2251,6 +2244,27 @@
    */
   let backfillLock = null;
 
+  /**
+   * If a long read stops publishing progress for this long, something is stuck
+   * (a blocked scroll, a modal, Instagram throttling the tab). Abort and say so
+   * rather than leaving "Reading history…" on screen forever.
+   */
+  const READ_STALL_MS = 45000;
+
+  function makeWatchdog(onStall) {
+    const wd = {
+      last: nowMs(),
+      fired: false,
+      beat() { wd.last = nowMs(); },
+      get stalled() { return nowMs() - wd.last > READ_STALL_MS; },
+      check() {
+        if (!wd.fired && wd.stalled) { wd.fired = true; onStall(); }
+        return wd.fired;
+      },
+    };
+    return wd;
+  }
+
   async function withBackfillLock(fn) {
     while (backfillLock) {
       try { await backfillLock; } catch (_) {}
@@ -2272,6 +2286,7 @@
 
   async function runBackfillLocked() {
     if (document.hidden) { STATE.backfilled = false; return 0; }
+    if (window.__relayWatchdog) window.__relayWatchdog.beat();
     hud('📜 Reading full history from the top…');
     let all = null;
     try {

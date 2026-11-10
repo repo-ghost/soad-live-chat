@@ -358,6 +358,7 @@ Two things you *should* change on the phone:
 | Reel thumbnails 403 | keep `<meta name="referrer" content="no-referrer">` in `<head>` (already set) |
 | Duplicate-looking history | the relay only pushes rows it has not seen; a fresh bootstrap on an empty DB is expected to push everything once |
 | Relay stops after switching chats | by design — reopen the target thread and it resumes automatically |
+| **"Reading history…" never finishes** | fixed in v2.4.0 — update, then press **⬆** again. If it still stalls, the pill now says *"History read stalled · DB left untouched"* within 45 s instead of hanging |
 | **Pill stuck on "Waiting for messages to render…"** | v2.2.0 names the reason in the pill itself. Tap the pill and read the *"what the page looks like"* block — it lists composer, transcript, text nodes, listboxes and scroll boxes. Then press **⬆** |
 | **Nothing saves / DB empty** | press **⬆**. If it still fails, long-press **⬆** and send the report — it says whether the composer and transcript were found at all |
 | **Profile pictures saved as message photos** | fixed in v2.3.0 — update the userscript, then press **⬆** once to rebuild the node cleanly |
@@ -383,6 +384,27 @@ Fixed in v2.3.0 by judging what is *on screen* plus explicit markers:
 
 An avatar also no longer counts as "this row has content", so a text message can never be
 promoted to a photo again.
+
+### Why "Reading history…" used to hang (and no longer does)
+
+The reading phase did the work **twice**: one full upward walk to load every message,
+then a second top→bottom walk to rebuild the order. On a long thread that is double the
+scrolling and double the waiting — and because the time limit was only checked at the top
+of the outer loop, a slow thread could blow past it by minutes.
+
+v2.4.0:
+
+- **one pass.** Upward steps are collected by prepending, so the list is already in chat
+  order; the second walk is gone.
+- **90 s ceiling** on the whole read (was up to 4 minutes).
+- **stall guard** — if the scroll position stops moving, it gives up instead of spinning.
+- **watchdog** — no progress for 45 s aborts the read and leaves the database untouched.
+- **faster nudging** — stops as soon as the loader answers instead of always doing three
+  rounds.
+- duplicate sightings collapse by signature, keeping genuinely-repeated messages.
+
+Measured on a 150-message thread: **30 s end to end**, and the pill never sat unchanged
+for more than 6 s.
 
 ### The ⬆ button — jump to the first message
 
