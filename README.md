@@ -358,10 +358,28 @@ Two things you *should* change on the phone:
 | Reel thumbnails 403 | keep `<meta name="referrer" content="no-referrer">` in `<head>` (already set) |
 | Duplicate-looking history | the relay only pushes rows it has not seen; a fresh bootstrap on an empty DB is expected to push everything once |
 | Relay stops after switching chats | by design — reopen the target thread and it resumes automatically |
-| **Pill stuck on "Waiting for messages to render…"** | v2.1.0 names the reason in the pill itself (no message box / no panel / panel empty). Reinstall the script, then **delete the `messages` node** and reload the chat |
+| **Pill stuck on "Waiting for messages to render…"** | v2.2.0 names the reason in the pill itself. Tap the pill and read the *"what the page looks like"* block — it lists composer, transcript, text nodes, listboxes and scroll boxes. Then press **⬆** |
+| **Nothing saves / DB empty** | press **⬆**. If it still fails, the panel tells you whether the composer or the transcript was found at all |
+| **Rows duplicated** | press **⬆** — it clears the node first. (Fixed in v2.2.0; older versions could double-write) |
 | **New profile photo does not appear** | GitHub Pages cached the old bytes — bump `ICON_VERSION` in `index.html` (see [§4](#profile-pictures)), then hard-refresh with Ctrl/Cmd+Shift+R |
 | **Forgot the login** | regenerate with `node tools/make-login.js <user> <pass>` and commit (see [§7](#7-login-gate)) |
 | **Gate won't accept the right password** | passwords are case-sensitive and it must be the *digest* you pasted — re-run `node tools/make-login.js` to be sure |
+
+### The ⬆ button — jump to the first message
+
+The purple **⬆** button sits above the status pill on instagram.com. Press it whenever
+the DB is empty, half-filled, or you just want the chat rebuilt from message #1:
+
+1. it scrolls the conversation all the way up, nudging Instagram's lazy loader
+   (scroll + wheel + touch events) until the transcript stops growing;
+2. it **deletes the `messages` node** — but only after it can actually see messages,
+   so a failed read can never wipe good data;
+3. it re-writes the entire history oldest → newest, with the usual 80 ms spacing.
+
+While it runs, normal scanning is suspended: two writers racing on the same thread
+was producing duplicated rows (104 rows for 36 messages). Only one history read can
+be in flight at a time, so pressing the button during the boot-time read queues
+behind it instead of fighting it.
 
 ### Why v2.1.0 suddenly "sees" messages again
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IG Direct → Live Mirror Relay (read-only)
 // @namespace    https://github.com/orin/soad-live-chat
-// @version      2.1.0
+// @version      2.2.0
 // @description  Mirrors ONE Instagram Direct thread to Firebase Realtime Database for a public read-only page. Client-side DOM observation only — no login automation, no private APIs. Mobile (Firefox for Android) friendly.
 // @author       Orin
 // @downloadURL  https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js
@@ -107,7 +107,7 @@
    * 2. INTERNALS
    * =================================================================================== */
 
-  const VERSION = '2.1.0';
+  const VERSION = '2.2.0';
   const DB = String(CONFIG.FIREBASE_DB_URL).replace(/\/+$/, '');
   const LOG = (...a) => console.log('%c[relay]', 'color:#A800FF;font-weight:700', ...a);
   const WARN = (...a) => console.warn('%c[relay]', 'color:#ff9f0a;font-weight:700', ...a);
@@ -125,6 +125,8 @@
     behindScans: 0,        // consecutive scans where the DOM lags the database
     looseDedupe: false,    // sticky fallback: dedupe by signature instead of alignment
     backfilled: false,     // one-time full-history read has run
+    resetPushed: false,    // manual "start at the first message" was completed
+    inManualBackfill: false,
     // diagnostics
     transport: 'unknown',  // 'gm' | 'fetch'
     lastStatus: null,      // last HTTP status from Firebase
@@ -176,6 +178,127 @@
     hudEl.title = 'Tap for diagnostics · long-press to hide';
     hudEl.addEventListener('click', () => togglePanel());
     document.documentElement.appendChild(hudEl);
+    ensureJumpButton();
+  }
+
+  let jumpBtn = null;
+
+  /**
+   * The ⬆ button: scrolls the conversation to the first message and re-reads the
+   * whole history, writing it to Firebase in order from scratch.
+   *
+   * It always clears the `messages` node first, so a half-finished earlier run
+   * cannot leave the database out of order. That is safe to do only when we can
+   * actually read the transcript, so the button refuses to wipe anything until
+   * it has seen at least one message.
+   */
+  function ensureJumpButton() {
+    if (!CONFIG.SHOW_HUD || jumpBtn) return;
+    jumpBtn = document.createElement('div');
+    jumpBtn.id = 'ig-relay-jump';
+    jumpBtn.textContent = '⬆';
+    jumpBtn.title = 'Go to the first message and re-sync the whole chat';
+    jumpBtn.setAttribute(
+      'style',
+      [
+        'position:fixed', 'right:12px', 'bottom:56px', 'z-index:2147483001',
+        'width:42px', 'height:42px', 'border-radius:50%',
+        'display:flex', 'align-items:center', 'justify-content:center',
+        'background:linear-gradient(135deg,#7000FF,#A800FF)', 'color:#fff',
+        'font:700 19px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+        'border:1px solid rgba(255,255,255,.28)',
+        'box-shadow:0 6px 22px rgba(0,0,0,.55)',
+        'cursor:pointer', 'user-select:none', 'touch-action:manipulation',
+      ].join(';')
+    );
+    // stop our own tap from reaching Instagram's handlers underneath
+    jumpBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      startManualBackfill();
+    });
+    document.documentElement.appendChild(jumpBtn);
+  }
+
+  function setJumpButtonBusy(busy, glyph) {
+    if (!jumpBtn) return;
+    jumpBtn.textContent = glyph || (busy ? '…' : '⬆');
+    jumpBtn.style.opacity = busy ? '0.75' : '1';
+  }
+
+  async function startManualBackfill() {
+    if (STATE.inManualBackfill) { hud('⏳ Already reading history…', 'warn'); return; }
+
+    // A boot-time read may still be in flight. Wiping the node underneath it is
+    // exactly how duplicates got created, so queue behind it.
+    if (backfillLock) {
+      hud('⏳ Finishing the current read first…', 'warn');
+      try { await backfillLock; } catch (_) {}
+    }
+
+    const id = chatIdFromUrl();
+    if (!id || id !== String(CONFIG.TARGET_CHAT_ID)) {
+      hud('⏸ Open the MD.Soad chat first', 'warn');
+      return;
+    }
+
+    STATE.inManualBackfill = true;
+    setJumpButtonBusy(true, '…');
+
+    try {
+      // ── 1. find the conversation before touching the database ──────────────
+      hud('⬆ Looking for the first message…');
+      const jump = await jumpToFirstMessage((count, round, grew) => {
+        hud('⬆ Scrolling to the first message… ' + count + ' items (round ' + round + ')');
+        setJumpButtonBusy(true, grew ? '⬆' : '…');
+      });
+
+      if (!jump.ok) {
+        hud('⚠️ ' + (jump.reason || 'could not reach the top') + ' · tap for details', 'bad');
+        STATE.lastError = 'jump: ' + (jump.reason || 'unknown');
+        return;
+      }
+
+      const bubbles = getBubbles().bubbles;
+      if (!bubbles.length) {
+        // Refuse to wipe: with nothing readable we would destroy good data.
+        hud('⚠️ No messages visible — not clearing the database', 'bad');
+        return;
+      }
+
+      // ── 2. clear, then write the full history in order ─────────────────────
+      hud('🧹 Clearing old copy…');
+      try {
+        await fbRequest('DELETE', '.json');
+      } catch (e) {
+        WARN('could not clear messages node', e.message);
+        hud('⚠️ Could not clear the database · check write rules', 'bad');
+        return;
+      }
+      STATE.tail = [];
+      STATE.reactions.clear();
+      STATE.looseDedupe = false;
+      STATE.wrote = 0;
+      STATE.resetPushed = false;
+
+      const saved = await runBackfill();   // flag stays set: scan() keeps out
+      setJumpButtonBusy(false);
+
+      if (saved) {
+        hud('✅ Saved all ' + saved + ' messages · back to live', 'ok');
+        await sleep(1400);
+        scan();
+      } else {
+        hud('⚠️ Found messages but nothing saved · tap for details', 'bad');
+      }
+    } catch (e) {
+      WARN('manual backfill failed', e);
+      STATE.lastError = e.message;
+      hud('⚠️ Refresh failed · tap for details', 'bad');
+    } finally {
+      STATE.inManualBackfill = false;
+      setJumpButtonBusy(false);
+    }
   }
 
   function hud(text, tone) {
@@ -254,6 +377,19 @@
       `relayed       : ${STATE.wrote}`,
       `known in DB   : ${STATE.tail.length}`,
       `last scan     : ${STATE.lastScanAt ? Math.round((nowMs() - STATE.lastScanAt) / 1000) + 's ago' : '—'}`,
+      ``,
+      `── what the page looks like ──`,
+      `composer      : ${safeFind('#composer', () => (findComposer() ? 'found' : 'NOT FOUND'))}`,
+      `transcript    : ${safeFind('#transcript', () => {
+        const sc = findThreadScroller();
+        if (!sc) return 'NOT FOUND';
+        return sc.scrollHeight + 'px / ' + sc.clientHeight + 'px, ' +
+               sc.querySelectorAll('[dir="auto"]').length + ' text nodes';
+      })}`,
+      `text nodes    : ${safeFind('#textnodes', () => document.querySelectorAll('[dir="auto"]').length)}`,
+      `listboxes     : ${safeFind('#listboxes', () => document.querySelectorAll('[role="listbox"]').length)}`,
+      `scroll boxes  : ${safeFind('#scrollboxes', () => scrollBoxSummary())}`,
+      `url           : ${location.pathname.slice(0, 60)}`,
     ];
 
     if (STATE.lastError) lines.push('', `last error    : ${STATE.lastError}`);
@@ -270,12 +406,33 @@
         })
         .join('\n') +
       `<div style="margin-top:10px;padding-top:9px;border-top:1px solid #2a2a2a;color:#888;font-family:system-ui">
-         Tap the pill to close · long-press the pill to hide entirely
+         <b style="color:#c084fc">⬆ button</b> = jump to the first message and re-sync everything.<br>
+         Tap the pill to close.
        </div>`;
   }
 
   function safeRowCount() {
     try { return getBubbles().bubbles.length; } catch (_) { return -1; }
+  }
+
+  function safeFind(label, fn) {
+    try { return String(fn()); } catch (e) { return 'error: ' + e.message; }
+  }
+
+  /** One line describing the biggest scroll containers on the page. */
+  function scrollBoxSummary() {
+    const out = [];
+    document.querySelectorAll('div, main, section, ul').forEach((el) => {
+      try {
+        const st = getComputedStyle(el);
+        if (!/(auto|scroll)/.test(st.overflowY)) return;
+        if (el.scrollHeight < 200) return;
+        const label = el.getAttribute('aria-label') || el.getAttribute('role') || el.tagName.toLowerCase();
+        out.push(label + ' ' + (el.scrollHeight - el.clientHeight) + 'px');
+      } catch (_) {}
+    });
+    if (!out.length) return 'none (nothing scrolls — is the chat open?)';
+    return out.slice(0, 3).join(' · ');
   }
 
   /** Turns a raw failure into an actionable explanation. */
@@ -1425,6 +1582,104 @@
     }
   }
 
+  /**
+   * ─────────────────────────────────────────────────────────────────────────────
+   * JUMP TO THE FIRST MESSAGE
+   * ─────────────────────────────────────────────────────────────────────────────
+   * Instagram never exposes "message #1" — you have to keep scrolling up until
+   * the transcript stops growing. This does exactly that, with every signal a
+   * lazy loader might listen for, and reports progress the whole way.
+   *
+   * Returns { ok, reachedTop, msgs, grew }.
+   */
+  async function jumpToFirstMessage(onProgress) {
+    const scroller = findThreadScroller();
+    if (!scroller) return { ok: false, reason: 'no conversation panel found' };
+
+    const startedAt = nowMs();
+    let stalls = 0;
+    let rounds = 0;
+    const seenCounts = [];
+
+    while (nowMs() - startedAt < CONFIG.MAX_BACKFILL_MS) {
+      if (document.hidden) return { ok: false, reason: 'tab went to the background' };
+
+      const beforeH = scroller.scrollHeight;
+      const beforeTop = scroller.scrollTop;
+      const beforeCount = countMessageish(scroller);
+
+      // 1. go to the very top the way a finger would
+      scroller.scrollTop = 0;
+      fireScrollHints(scroller);
+      await sleepScroll(CONFIG.SCROLL_SETTLE_MS);
+
+      // 2. still at the top? then ask the loader for another page
+      if (scroller.scrollHeight <= beforeH + 2 && scroller.scrollTop <= beforeTop + 2) {
+        fireScrollHints(scroller, -1);          // wheel up = "older messages"
+        scroller.scrollTop = Math.min(80, scroller.scrollHeight);
+        await sleepScroll(140);
+        scroller.scrollTop = 0;
+        fireScrollHints(scroller);
+        await sleepScroll(CONFIG.SCROLL_SETTLE_MS);
+      }
+
+      rounds++;
+      const grew = scroller.scrollHeight > beforeH + 2 || countMessageish(scroller) > beforeCount;
+      const count = countMessageish(scroller);
+      seenCounts.push(count);
+      if (onProgress) onProgress(count, rounds, grew);
+
+      if (grew) { stalls = 0; continue; }
+
+      // 3. nothing new. Tolerate a few slow loads before believing we are done.
+      stalls++;
+      if (stalls >= CONFIG.SCROLL_TOP_GRACE) {
+        return {
+          ok: true,
+          reachedTop: scroller.scrollTop <= 4,
+          msgs: count,
+          grew: count > (seenCounts[0] || 0),
+          rounds,
+        };
+      }
+      await sleepScroll(260);
+    }
+
+    return { ok: false, reason: 'timed out', msgs: countMessageish(scroller) };
+  }
+
+  /** How many message-shaped things are rendered right now (cheap, stable). */
+  function countMessageish(root) {
+    try {
+      const r = root || findThreadScroller() || document.body;
+      return r.querySelectorAll('[dir="auto"], img, video, audio').length;
+    } catch (_) { return 0; }
+  }
+
+  /**
+   * Fire the events a virtualised/lazy transcript listens for. Doing only
+   * `scrollTop = 0` is not enough: when the content already fits, nothing moves
+   * and no event is emitted, so the loader never hears us.
+   */
+  function fireScrollHints(scroller, direction) {
+    const dir = direction === undefined ? -1 : direction;
+    try { scroller.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+    try {
+      const r = scroller.getBoundingClientRect();
+      scroller.dispatchEvent(new WheelEvent('wheel', {
+        bubbles: true, cancelable: true,
+        deltaY: dir * 900, deltaMode: 0,
+        clientX: Math.round(r.left + r.width / 2),
+        clientY: Math.round(r.top + r.height / 2),
+      }));
+    } catch (_) {}
+    try {
+      scroller.dispatchEvent(new TouchEvent('touchstart', { bubbles: true }));
+      scroller.dispatchEvent(new TouchEvent('touchmove', { bubbles: true }));
+      scroller.dispatchEvent(new TouchEvent('touchend', { bubbles: true }));
+    } catch (_) {}
+  }
+
   /** Everything currently rendered, in top→bottom order (no scrolling needed). */
   function harvestRendered() {
     let { bubbles } = getBubbles();        // already sorted top → bottom
@@ -1703,15 +1958,27 @@
       return;
     }
 
+    // A history read owns the conversation while it runs: its own pointers, its
+    // own seen-sets. Syncing on top of it is what duplicated rows (104 for 36).
+    if (backfillLock || STATE.inManualBackfill) return;
+
     STATE.scanning = true;
     STATE.paused = false;
     STATE.lastScanAt = nowMs();
 
     try {
       // ── full-history backfill, once, when the database is empty ──────────────
-      if (CONFIG.BACKFILL && !STATE.backfilled && STATE.tail.length === 0) {
+      // Automatic full-history read: only when the DB is genuinely empty, and
+      // only ONCE per page load. If it comes back empty we stop trying, so the
+      // relay can never sit in a silent backfill loop — the ⬆ button is the
+      // explicit way to ask again.
+      if (CONFIG.BACKFILL && !STATE.backfilled && !STATE.inManualBackfill && STATE.tail.length === 0) {
         STATE.backfilled = true;
-        return await runBackfill();
+        const saved = await runBackfill();
+        if (!saved) {
+          hud('⏳ Nothing saved yet · tap ⬆ button to read from the first message', 'warn');
+        }
+        return;
       }
 
       const { bubbles } = getBubbles();
@@ -1762,9 +2029,35 @@
     hud('⏳ Waiting (' + waited + 's) · ' + why, 'warn');
   }
 
+  /**
+   * Only one history read may run at a time. Two concurrent backfills share the
+   * same `seen` sets and the same Firebase tail, which produced duplicated and
+   * out-of-order rows (86 rows for 36 messages). Everything that can start a
+   * read goes through this lock.
+   */
+  let backfillLock = null;
+
+  async function withBackfillLock(fn) {
+    while (backfillLock) {
+      try { await backfillLock; } catch (_) {}
+    }
+    let release;
+    backfillLock = new Promise((r) => { release = r; });
+    try {
+      return await fn();
+    } finally {
+      release();
+      backfillLock = null;
+    }
+  }
+
   /** Scroll the whole conversation once, then push everything in chat order. */
   async function runBackfill() {
-    if (document.hidden) { STATE.backfilled = false; return; }
+    return withBackfillLock(() => runBackfillLocked());
+  }
+
+  async function runBackfillLocked() {
+    if (document.hidden) { STATE.backfilled = false; return 0; }
     hud('📜 Reading full history from the top…');
     let all = null;
     try {
@@ -1775,9 +2068,10 @@
       WARN('backfill failed', e);
     }
     if (!all || !all.length) {
-      STATE.backfilled = false;
-      hud('⚠️ Could not read history · tap', 'bad');
-      return;
+      // Do NOT clear the flag: an automatic retry loop would hide the failure
+      // behind a permanent "reading history" pill. The user gets a button.
+      hud('⚠️ Could not read history · tap ⬆ button', 'bad');
+      return 0;
     }
 
     STATE.tail = [];
@@ -1798,8 +2092,16 @@
       }
       await sleep(CONFIG.POST_DELAY_MS);
     }
+    STATE.resetPushed = true;
+    LOG('backfill collected', all.length, 'items:',
+        all.slice(0, 6).map((i) => (i.text || i.kind)).join(' | '), '…');
+    if (all.length > 2) {
+      const firstDupes = all.filter((it, i) => i && all[i - 1] && all[i - 1].sig === it.sig).length;
+      if (firstDupes) WARN('backfill: ' + firstDupes + ' adjacent duplicate signatures');
+    }
     hud('🔴 Live · ' + STATE.wrote + ' relayed', 'ok');
     LOG('backfill complete:', n, 'messages');
+    return n;
   }
 
   /**
