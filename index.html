@@ -292,11 +292,153 @@
   }
   .empty .big{font-size:30px;margin-bottom:10px}
   .hidden{display:none!important}
+
+  /* ══ LOGIN GATE ══════════════════════════════════════════════════════ */
+  .gate{
+    position:fixed;inset:0;z-index:100;
+    display:grid;place-items:center;
+    background:
+      radial-gradient(760px 520px at 50% 8%, #2a0f45 0%, #0a0610 55%, #000 100%);
+    padding:22px;
+    animation:gateIn .4s ease both;
+  }
+  @keyframes gateIn{from{opacity:0}to{opacity:1}}
+  .gate.leaving{animation:gateOut .45s ease both}
+  @keyframes gateOut{to{opacity:0;transform:scale(.985)}}
+
+  .gate-card{
+    width:100%;max-width:344px;
+    background:rgba(18,18,18,.9);
+    border:1px solid #2f2f2f;
+    border-radius:20px;
+    padding:26px 24px 22px;
+    box-shadow:0 28px 70px rgba(0,0,0,.75), 0 0 0 1px rgba(255,255,255,.02) inset;
+    backdrop-filter:blur(18px);
+    text-align:center;
+  }
+  .gate-logo{
+    width:62px;height:62px;margin:0 auto 14px;border-radius:50%;
+    background:var(--grad);display:grid;place-items:center;
+    box-shadow:0 10px 30px rgba(168,0,255,.35);
+  }
+  .gate-logo svg{width:30px;height:30px;fill:#fff}
+  .gate-title{font-size:19px;font-weight:700;letter-spacing:-.3px;margin:0 0 4px}
+  .gate-sub{font-size:12.5px;color:var(--muted);margin:0 0 20px;line-height:1.5}
+
+  .field{position:relative;margin-bottom:10px;text-align:left}
+  .field input{
+    width:100%;box-sizing:border-box;
+    background:#0e0e0e;border:1px solid #333;border-radius:12px;
+    padding:13px 40px 13px 13px;
+    font-size:14.5px;color:#f2f2f2;font-family:inherit;
+    outline:none;transition:border-color .18s, background .18s;
+  }
+  .field input::placeholder{color:#767676}
+  .field input:focus{border-color:#6a2fa8;background:#111}
+  .field input:disabled{opacity:.6}
+  .eye{
+    position:absolute;right:6px;top:50%;transform:translateY(-50%);
+    width:30px;height:30px;border:0;background:transparent;color:#8a8a8a;
+    display:grid;place-items:center;cursor:pointer;border-radius:8px;padding:0;
+  }
+  .eye:hover{color:#ddd}
+  .eye svg{width:18px;height:18px;stroke:currentColor;fill:none;
+    stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+  .gate-btn{
+    width:100%;margin-top:6px;
+    background:var(--grad);color:#fff;border:0;border-radius:12px;
+    padding:13px;font-size:14.5px;font-weight:700;font-family:inherit;
+    cursor:pointer;letter-spacing:.2px;
+    display:flex;align-items:center;justify-content:center;gap:8px;
+    transition:filter .18s, transform .08s;
+  }
+  .gate-btn:hover{filter:brightness(1.1)}
+  .gate-btn:active{transform:scale(.988)}
+  .gate-btn[disabled]{opacity:.65;cursor:progress}
+
+  .gate-err{
+    min-height:17px;margin:10px 0 0;font-size:12px;color:#ff6961;
+    opacity:0;transition:opacity .2s;line-height:1.4;
+  }
+  .gate-err.show{opacity:1}
+  .gate-hint{
+    margin:16px 0 0;font-size:10.5px;color:#5f5f5f;line-height:1.55;
+    border-top:1px solid #262626;padding-top:12px;
+  }
+  .field.shake{animation:shake .34s ease}
+  @keyframes shake{
+    0%,100%{transform:translateX(0)}
+    20%{transform:translateX(-6px)}40%{transform:translateX(6px)}
+    60%{transform:translateX(-4px)}80%{transform:translateX(4px)}
+  }
+  .spinner{
+    width:13px;height:13px;border-radius:50%;
+    border:2px solid rgba(255,255,255,.35);border-top-color:#fff;
+    animation:spin .7s linear infinite;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* sign-out chip, shown in the header once unlocked */
+  .logout{
+    font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+    color:#8a8a8a;background:rgba(255,255,255,.05);
+    border:1px solid #2f2f2f;border-radius:99px;
+    padding:3px 8px;cursor:pointer;font-family:inherit;
+    transition:color .15s,border-color .15s;
+  }
+  .logout:hover{color:#fff;border-color:#555}
 </style>
 </head>
 <body>
 
-<div class="phone" id="phone">
+<!-- ══════════════════════════════════════════════════════════════════════
+     LOGIN GATE
+     ⚠️ This is a static page: the check below is a SHA-style digest compare,
+     which keeps the password out of plain sight but CANNOT be real security
+     (anyone can read this file). To make it genuinely private, set the
+     Firebase rules to "auth != null" and sign in with Firebase Auth instead.
+     ═════════════════════════════════════════════════════════════════════ -->
+<div class="gate" id="gate" role="dialog" aria-modal="true" aria-labelledby="gateTitle">
+  <form class="gate-card" id="gateForm" autocomplete="on" novalidate>
+    <div class="gate-logo">
+      <svg viewBox="0 0 24 24" aria-hidden="true"
+           style="fill:#fff;stroke:none">
+        <path d="M17.3 9.6h-.9V7.7a4.4 4.4 0 1 0-8.8 0v1.9h-.9A1.9 1.9 0 0 0 4.8 11.5v7A1.9 1.9 0 0 0 6.7 20.4h10.6a1.9 1.9 0 0 0 1.9-1.9v-7a1.9 1.9 0 0 0-1.9-1.9zm-7.9-1.9a3.1 3.1 0 0 1 6.2 0v1.9H9.4V7.7zM13 15.6a1 1 0 0 1-2 0v-2.5a1 1 0 0 1 2 0v2.5z"/>
+      </svg>
+    </div>
+
+    <h1 class="gate-title" id="gateTitle">Private live stream</h1>
+    <p class="gate-sub">Sign in to watch the live mirror.<br>Read-only — no one can reply from here.</p>
+
+    <div class="field" id="userField">
+      <input id="gateUser" name="username" type="text" placeholder="Username"
+             autocomplete="username" autocapitalize="none" autocorrect="off"
+             spellcheck="false" aria-label="Username" />
+    </div>
+
+    <div class="field" id="passField">
+      <input id="gatePass" name="password" type="password" placeholder="Password"
+             autocomplete="current-password" aria-label="Password" />
+      <button class="eye" id="eyeBtn" type="button" aria-label="Show password" tabindex="-1">
+        <svg viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+      </button>
+    </div>
+
+    <button class="gate-btn" id="gateBtn" type="submit">Sign in</button>
+    <p class="gate-err" id="gateErr" role="alert" aria-live="polite"></p>
+
+    <p class="gate-hint">
+      <svg viewBox="0 0 24 24" aria-hidden="true" style="width:10px;height:10px;vertical-align:-1px;fill:#5f5f5f">
+        <path d="M17.3 9.6h-.9V7.7a4.4 4.4 0 1 0-8.8 0v1.9h-.9A1.9 1.9 0 0 0 4.8 11.5v7A1.9 1.9 0 0 0 6.7 20.4h10.6a1.9 1.9 0 0 0 1.9-1.9v-7a1.9 1.9 0 0 0-1.9-1.9zm-7.9-1.9a3.1 3.1 0 0 1 6.2 0v1.9H9.4V7.7z"/>
+      </svg>
+      Credentials are checked in your browser only.<br>
+      This is a static site — for true privacy, enable Firebase Auth rules.
+    </p>
+  </form>
+</div>
+
+<div class="phone" id="phone" hidden>
 
   <!-- ══ HEADER ══════════════════════════════════════════════════════════ -->
   <header>
@@ -332,6 +474,7 @@
       <button class="icon-btn" aria-label="Video call" title="Video call (mock)">
         <svg viewBox="0 0 24 24"><rect x="2.5" y="6" width="13" height="12" rx="3"/><path d="M15.5 11l6-3.5v9L15.5 13z"/></svg>
       </button>
+      <button class="logout" id="logoutBtn" type="button" title="Sign out" hidden>Log out</button>
     </div>
   </header>
 
@@ -393,6 +536,20 @@
    * serving the OLD photo. Bump this one number whenever you upload new pictures
    * and every visitor fetches the fresh file immediately.
    * Also honours the "?v=..." query string, so you can test with ?v=2 in the URL. */
+  /* ── Login gate ─────────────────────────────────────────────────────────
+   * Credentials are stored as short digests, not plain text, so the password is
+   * not sitting in the page source. This is obfuscation, NOT security: a static
+   * site cannot keep a secret from someone who reads the file. See README §8.
+   *
+   * Change the login: run `node tools/make-login.js <user> <pass>` and paste
+   * the two digests below. */
+  const AUTH = {
+    user: "27aenj-ykm3ed",
+    pass: "yowsi8-yjekao",
+    storageKey: "soadMirror.auth",
+    sessionHours: 12,          // how long a sign-in is remembered
+  };
+
   const ICON_VERSION = "1";
   const urlVersion = new URLSearchParams(location.search).get("v");
   const V = urlVersion || ICON_VERSION;
@@ -800,10 +957,16 @@
    *  5. Boot
    * ═══════════════════════════════════════════════════════════════════ */
   const configured = FIREBASE_CONFIG.databaseURL && !/YOUR-PROJECT-ID/.test(FIREBASE_CONFIG.databaseURL);
+  let started = false;   // data connection must only ever open once
 
-  if (!configured){
-    runDemo();
-  } else {
+  /** Opens the live stream (or demo mode). Called exactly once, after sign-in. */
+  function startApp(){
+    if (started) return;
+    started = true;
+    if (!configured){
+      runDemo();
+      return;
+    }
     connectFirebase().catch((e) => {
       console.error("[mirror] Firebase failed:", e);
       connState.textContent = "connection failed";
@@ -814,6 +977,154 @@
       setTimeout(runDemo, 600);
     });
   }
+
+  /* ════════════════════════════════════════════════════════════════════
+   *  5b. Login gate
+   * ═══════════════════════════════════════════════════════════════════ */
+  const gate = document.getElementById("gate");
+  const gateForm = document.getElementById("gateForm");
+  const gateUser = document.getElementById("gateUser");
+  const gatePass = document.getElementById("gatePass");
+  const gateBtn = document.getElementById("gateBtn");
+  const gateErr = document.getElementById("gateErr");
+  const logoutBtn = document.getElementById("logoutBtn");
+  const eyeBtn = document.getElementById("eyeBtn");
+
+  /** FNV-1a + djb2 digest — mirrors tools/make-login.js exactly. */
+  function digest(str){
+    let h1 = 0x811c9dc5, h2 = 5381;
+    for (let i = 0; i < str.length; i++){
+      const c = str.charCodeAt(i);
+      h1 ^= c;
+      h1 = (h1 + ((h1 << 1) + (h1 << 4) + (h1 << 7) + (h1 << 8) + (h1 << 24))) >>> 0;
+      h2 = (((h2 << 5) + h2) + c) >>> 0;
+    }
+    return (h1 >>> 0).toString(36) + "-" + (h2 >>> 0).toString(36);
+  }
+
+  /** Constant-ish time compare (avoids bailing out on the first wrong char). */
+  function safeEqual(a, b){
+    if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+  }
+
+  function readSession(){
+    try{
+      const raw = localStorage.getItem(AUTH.storageKey);
+      if (!raw) return null;
+      const s = JSON.parse(raw);
+      if (!s || typeof s.exp !== "number") return null;
+      if (Date.now() > s.exp){ localStorage.removeItem(AUTH.storageKey); return null; }
+      return s;
+    }catch(_){ return null; }
+  }
+
+  function writeSession(){
+    try{
+      localStorage.setItem(AUTH.storageKey, JSON.stringify({
+        u: AUTH.user,
+        exp: Date.now() + AUTH.sessionHours * 3600 * 1000,
+      }));
+    }catch(_){ /* private mode — session just won't persist */ }
+  }
+
+  function clearSession(){
+    try{ localStorage.removeItem(AUTH.storageKey); }catch(_){}
+  }
+
+  function showError(msg){
+    gateErr.textContent = msg;
+    gateErr.classList.add("show");
+    [document.getElementById("userField"), document.getElementById("passField")]
+      .forEach((f) => { if (f){ f.classList.remove("shake"); void f.offsetWidth; f.classList.add("shake"); } });
+  }
+
+  function unlock(animate){
+    gateErr.classList.remove("show");
+    gateForm.reset();
+    logoutBtn.hidden = false;
+    const finish = () => {
+      gate.hidden = true;
+      gate.style.display = "none";
+      document.getElementById("phone").hidden = false;   // reveal the app shell
+      startApp();
+    };
+    if (animate){
+      gate.classList.add("leaving");
+      setTimeout(finish, 420);
+    } else {
+      finish();
+    }
+  }
+
+  function lock(){
+    clearSession();
+    location.reload();     // simplest way to tear down the live listeners
+  }
+
+  eyeBtn.addEventListener("click", () => {
+    const showing = gatePass.type === "text";
+    gatePass.type = showing ? "password" : "text";
+    eyeBtn.setAttribute("aria-label", showing ? "Show password" : "Hide password");
+    eyeBtn.style.color = showing ? "#8a8a8a" : "#ddd";
+    gatePass.focus();
+  });
+
+  gateForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const u = gateUser.value.trim().toLowerCase();
+    const p = gatePass.value;                       // passwords keep their case
+    if (!u || !p){ showError("Enter both a username and password."); return; }
+
+    gateBtn.disabled = true;
+    gateBtn.innerHTML = '<span class="spinner"></span> Checking…';
+
+    // small delay: avoids a flash of the chat and blunts naive brute-force loops
+    setTimeout(() => {
+      const ok = safeEqual(digest(u), AUTH.user) & safeEqual(digest(p), AUTH.pass);
+      gateBtn.disabled = false;
+      gateBtn.textContent = "Sign in";
+
+      if (!ok){
+        showError("Wrong username or password.");
+        gatePass.value = "";
+        gatePass.focus();
+        return;
+      }
+      writeSession();
+      unlock(true);
+    }, 480);
+  });
+
+  logoutBtn.addEventListener("click", lock);
+
+  // A keypress anywhere focuses the first empty field.
+  document.addEventListener("keydown", (e) => {
+    if (gate.style.display === "none" || gate.hidden) return;
+    if (e.key === "Enter") return;                  // form handles it
+    if (document.activeElement === document.body && e.key.length === 1){
+      (gateUser.value ? gatePass : gateUser).focus();
+    }
+  });
+
+  // ── decide what the visitor sees ──────────────────────────────────────────
+  (function bootAuth(){
+    if (readSession()){
+      gate.hidden = true;
+      gate.style.display = "none";
+      document.getElementById("phone").hidden = false;
+      logoutBtn.hidden = false;
+      startApp();
+      return;
+    }
+    // signed out: keep the phone shell hidden so no data loads or flashes
+    document.getElementById("phone").hidden = true;
+    gate.hidden = false;
+    gate.style.display = "";
+    gateUser.focus();
+  })();
 </script>
 </body>
 </html>

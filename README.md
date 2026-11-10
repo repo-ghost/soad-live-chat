@@ -55,7 +55,7 @@ paste this:
 > messages. That is the trade-off for not storing credentials in a userscript. Mitigations:
 > it is a *display-only* mirror (nobody can reply from it), the `.validate` rule blocks
 > malformed rows, and you can wipe the `messages` node at any time from the console.
-> If you want it locked down harder, see [§6 Hardening](#6-optional-hardening).
+> If you want it locked down harder, see [§6 Hardening](#6-optional-hardening) and [§7 Login gate](#7-login-gate).
 
 Copy your database URL from the console header — it looks like
 `https://<project-id>-default-rtdb.firebaseio.com/` (some regions add
@@ -206,7 +206,82 @@ and point `FIREBASE_DB_URL` at the Worker. Everything else stays identical.
 
 ---
 
-## 7. Troubleshooting
+## 7. Login gate
+
+The site now asks for a username and password before it renders the chat.
+
+```
+Username: live
+Password: 5967
+```
+
+A signed-in visitor stays signed in for **12 hours** (per browser), then the gate returns.
+The header has a **LOG OUT** chip that clears the session immediately.
+
+Change the credentials any time:
+
+```bash
+node tools/make-login.js newuser newpass
+```
+
+Paste the two printed digests into the `AUTH` block near the top of `index.html`:
+
+```js
+const AUTH = {
+  user: "27aenj-ykm3ed",   // ← digest of your username
+  pass: "yowsi8-yjekao",   // ← digest of your password
+  storageKey: "soadMirror.auth",
+  sessionHours: 12,
+};
+```
+
+Rules of thumb: usernames match **case-insensitively**, passwords are **case-sensitive**,
+and both are trimmed of surrounding spaces.
+
+### ⚠️ What this login actually protects — read this
+
+`index.html` is a **static file served to every visitor**. Any check written inside it can be
+read and bypassed by anyone who opens View Source. What this gate does:
+
+| ✅ It does | ❌ It does not |
+|---|---|
+| Stops casual visitors from casually browsing the chat | Stop a determined person |
+| Keeps the password out of plain sight (digests, not text) | Secure the Firebase data — the database URL is still in the file |
+| Hides the chat from link-preview bots that don't run JS | Encrypt anything |
+| Gives you a clean "private" front door | Act as identity or access control |
+
+It also cannot stop someone from reading your Firebase **REST** endpoint directly
+(`https://<project>-default-rtdb.firebaseio.com/messages.json`), because the rules in §1 are
+public-read.
+
+**If you want genuine privacy**, do this instead — it takes about five minutes:
+
+1. Firebase console → **Authentication → Sign-in method → Email/Password → Enable**.
+2. **Users → Add user**, e.g. `live@yourdomain.com` with password `5967`.
+3. Set the database rules to require auth:
+
+   ```json
+   {
+     "rules": {
+       "messages": {
+         ".read": "auth != null",
+         ".write": true,
+         ".indexOn": ["ts"]
+       }
+     }
+   }
+   ```
+
+4. Keep this page's gate (it is a nice first screen), but add the Firebase Auth sign-in so the
+   data itself is protected. The viewer already loads the SDK — swap the gate's `digest()`
+   comparison for `signInWithEmailAndPassword()` and the database will refuse to serve data
+   to anyone without a valid login, no matter what they edit in the page source.
+
+The userscript keeps working either way, because its writes stay permitted by `.write: true`.
+
+---
+
+## 8. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -218,6 +293,8 @@ and point `FIREBASE_DB_URL` at the Worker. Everything else stays identical.
 | Duplicate-looking history | the relay only pushes rows it has not seen; a fresh bootstrap on an empty DB is expected to push everything once |
 | Relay stops after switching chats | by design — reopen the target thread and it resumes automatically |
 | **New profile photo does not appear** | GitHub Pages cached the old bytes — bump `ICON_VERSION` in `index.html` (see [§4](#profile-pictures)), then hard-refresh with Ctrl/Cmd+Shift+R |
+| **Forgot the login** | regenerate with `node tools/make-login.js <user> <pass>` and commit (see [§7](#7-login-gate)) |
+| **Gate won't accept the right password** | passwords are case-sensitive and it must be the *digest* you pasted — re-run `node tools/make-login.js` to be sure |
 
 ### How catch-up avoids duplicates
 
