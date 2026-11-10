@@ -135,11 +135,27 @@ Drop your photos into `icon/` using these exact names:
 
 | File | Used for |
 |---|---|
-| `icon/soad-pfp.jpg` | the friend (header + every incoming bubble) |
-| `icon/orin-pfp.jpg` | favicon + fallback |
+| `icon/soad-pfp.jpg` | MD.Soad — header + every incoming bubble |
+| `icon/orin-pfp.jpg` | Orin — favicon + fallback |
 
-Placeholder gradients are already committed, so the page looks finished before you upload.
-Overwrite them — no code changes needed.
+**Replacing a photo later?** GitHub Pages caches images hard, so simply overwriting the
+file can keep showing the old one. Two steps fix it:
+
+1. Overwrite `icon/soad-pfp.jpg` (keep the filename).
+2. Bump `ICON_VERSION` in `index.html`:
+
+   ```js
+   const ICON_VERSION = "1";   // → "2", then 3, 4 …
+   ```
+
+That appends `?v=2` to every avatar URL, so browsers and the Pages CDN fetch the new file
+immediately. To check a photo *without* redeploying, open the page with `?v=2` in the URL:
+
+```
+https://<username>.github.io/<repo>/?v=2
+```
+
+Square images work best (Instagram crops to a circle). ~240×240 px is plenty.
 
 > **Until `databaseURL` is set**, the page runs in **demo mode** (a yellow "DEMO DATA" ribbon,
 > simulated messages, working photo/reel/voice/reaction rendering). That is what you see on
@@ -201,6 +217,7 @@ and point `FIREBASE_DB_URL` at the Worker. Everything else stays identical.
 | Reel thumbnails 403 | keep `<meta name="referrer" content="no-referrer">` in `<head>` (already set) |
 | Duplicate-looking history | the relay only pushes rows it has not seen; a fresh bootstrap on an empty DB is expected to push everything once |
 | Relay stops after switching chats | by design — reopen the target thread and it resumes automatically |
+| **New profile photo does not appear** | GitHub Pages cached the old bytes — bump `ICON_VERSION` in `index.html` (see [§4](#profile-pictures)), then hard-refresh with Ctrl/Cmd+Shift+R |
 
 ### How catch-up avoids duplicates
 

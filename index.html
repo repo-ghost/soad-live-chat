@@ -7,7 +7,7 @@
 <!-- Prevents Meta CDN 403s on reel thumbnails -->
 <meta name="referrer" content="no-referrer" />
 <title>Orin &amp; MD.Soad · Live</title>
-<link rel="icon" href="./icon/orin-pfp.jpg" />
+<link rel="icon" id="favicon" href="./icon/orin-pfp.jpg" />
 
 <style>
   :root{
@@ -306,8 +306,7 @@
 
     <div class="who" title="MD.Soad">
       <div class="avatar-wrap">
-        <img class="avatar" id="friendAvatar" src="./icon/soad-pfp.jpg" alt="MD.Soad"
-             data-fallback-2="./icon/orin-pfp.jpg">
+        <img class="avatar" id="friendAvatar" alt="MD.Soad">
         <div class="avatar-fallback" id="friendFallback">S</div>
         <i class="dot-online"></i>
       </div>
@@ -389,6 +388,17 @@
   const MY_NAME = "Orin";
   const FRIEND_NAME = "MD.Soad";
 
+  /* ── Avatar cache-busting ───────────────────────────────────────────────
+   * GitHub Pages caches images aggressively, so replacing icon/soad-pfp.jpg kept
+   * serving the OLD photo. Bump this one number whenever you upload new pictures
+   * and every visitor fetches the fresh file immediately.
+   * Also honours the "?v=..." query string, so you can test with ?v=2 in the URL. */
+  const ICON_VERSION = "1";
+  const urlVersion = new URLSearchParams(location.search).get("v");
+  const V = urlVersion || ICON_VERSION;
+  const FRIEND_PFP = "./icon/soad-pfp.jpg?v=" + encodeURIComponent(V);
+  const MY_PFP = "./icon/orin-pfp.jpg?v=" + encodeURIComponent(V);
+
   /* ════════════════════════════════════════════════════════════════════
    *  0. safe <script> injection (works even outside a real module ctx)
    * ═══════════════════════════════════════════════════════════════════ */
@@ -432,14 +442,22 @@
   const els = new Map();        // key -> { wrap, bubble, rx, data }
 
   /**
-   * Avatar fallback chain: ./icon/soad-pfp.jpg → ./icon/orin-pfp.jpg → initials circle.
-   * (Replace icon/soad-pfp.jpg with the real photo — same filename, nothing else to edit.)
+   * Avatar fallback chain: soad-pfp.jpg → orin-pfp.jpg → initials circle.
+   * Overwrite the files in icon/ and bump ICON_VERSION to bypass the CDN cache.
    */
   // header avatar: keep the fallback chain, but bind it as a listener (inline handlers
   // cannot see module scope). Runs as soon as the element is reachable.
   (function bindHeaderAvatar(){
     const img = document.getElementById("friendAvatar");
-    if (img) img.addEventListener("error", () => avatarFallback(img));
+    if (!img) return;
+    img.dataset.fallback2 = MY_PFP;
+    img.addEventListener("error", () => avatarFallback(img));
+    img.src = FRIEND_PFP;                    // versioned URL set at runtime
+  })();
+
+  (function setFavicon(){
+    const link = document.getElementById("favicon");
+    if (link) link.href = MY_PFP;
   })();
 
   function avatarFallback(img, mini){
