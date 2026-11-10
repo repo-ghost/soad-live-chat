@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IG Direct → Live Mirror Relay (read-only)
 // @namespace    https://github.com/orin/soad-live-chat
-// @version      2.0.0
+// @version      2.1.0
 // @description  Mirrors ONE Instagram Direct thread to Firebase Realtime Database for a public read-only page. Client-side DOM observation only — no login automation, no private APIs. Mobile (Firefox for Android) friendly.
 // @author       Orin
 // @downloadURL  https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js
@@ -107,7 +107,7 @@
    * 2. INTERNALS
    * =================================================================================== */
 
-  const VERSION = '2.0.0';
+  const VERSION = '2.1.0';
   const DB = String(CONFIG.FIREBASE_DB_URL).replace(/\/+$/, '');
   const LOG = (...a) => console.log('%c[relay]', 'color:#A800FF;font-weight:700', ...a);
   const WARN = (...a) => console.warn('%c[relay]', 'color:#ff9f0a;font-weight:700', ...a);
@@ -544,90 +544,201 @@
       '[contenteditable="true"][role="textbox"]',
       'div[role="textbox"][contenteditable="true"]',
       'textarea[placeholder]',
-      'input[placeholder]',
       '[aria-label*="Message" i][contenteditable="true"]',
-      '[contenteditable="true"]',
+      'div[contenteditable="true"]',
     ].join(',');
     const nodes = Array.from(document.querySelectorAll(sel));
     for (const n of nodes) {
       if (n.closest('[role="dialog"]')) continue;
       const r = n.getBoundingClientRect();
       if (r.width < 40 || r.height < 12) continue;
-      // the composer is in the lower half of the screen
-      if (r.top < window.innerHeight * 0.35) continue;
+      if (r.top < window.innerHeight * 0.30) continue;   // composer sits low
       return n;
     }
     return null;
   }
 
+  /** True when the element is a real scroll container with overflow content. */
+  function isScrollable(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    try {
+      const st = getComputedStyle(el);
+      if (!/(auto|scroll)/.test(st.overflowY)) return false;
+      return el.scrollHeight > el.clientHeight + 12;
+    } catch (_) { return false; }
+  }
+
   /**
-   * The scrollable element that holds the conversation.
-   * Walks up from the composer to the nearest ancestor that scrolls.
+   * Softer test used while resolving the transcript: an `overflow-y:auto` box
+   * that is not scrolling *yet* is still the right container — Instagram fills
+   * it lazily, and a chat whose messages currently fit the screen has
+   * scrollHeight === clientHeight until more history is loaded. Rejecting those
+   * was why backfill could not start on short/idle threads.
+   */
+  function canScroll(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    try {
+      const st = getComputedStyle(el);
+      if (!/(auto|scroll)/.test(st.overflowY)) return false;
+      const r = el.getBoundingClientRect();
+      return r.height >= 120 && r.height <= window.innerHeight + 40;
+    } catch (_) { return false; }
+  }
+
+  /**
+   * ─────────────────────────────────────────────────────────────────────────────
+   * THREAD SCAFFOLDING
+   * ─────────────────────────────────────────────────────────────────────────────
+   * Verified against how Instagram's Direct DOM looks as of the 2025/26 rewrite:
+   * the message transcript is a `div[role="listbox"]` (usually aria-label
+   * "Messages"), and individual messages NO LONGER have role="row"/role="grid".
+   * So we locate the transcript by role/aria-label first, then by geometry.
    */
   function findThreadScroller() {
     const composer = findComposer();
     const composerTop = composer ? composer.getBoundingClientRect().top : window.innerHeight;
-
-    // Candidate must ACTUALLY scroll: overflow auto/scroll AND overflow content.
-    const scrollable = (el) => {
-      if (!el || !el.getBoundingClientRect) return false;
-      try {
-        const st = getComputedStyle(el);
-        if (!/(auto|scroll)/.test(st.overflowY)) return false;
-        return el.scrollHeight > el.clientHeight + 12;
-      } catch (_) { return false; }
+    const holdsMessages = (el) => {
+      if (!el) return false;
+      if (el.querySelectorAll('[dir="auto"], img, audio, video').length < 1) return false;
+      // never the inbox rail
+      if (el.querySelector('a[href*="/direct/t/"]')) return false;
+      return true;
     };
 
+    // ── Signal 1: the transcript listbox / Messages region ───────────────────
+    // NOTE: these are often NOT scrollable themselves — Instagram puts the
+    // scroller in a wrapper. So we resolve the *effective* scroller afterwards.
+    const listboxCandidates = [];
+    const pushCand = (el) => {
+      if (!el || el.closest('[role="dialog"]')) return;
+      if (!holdsMessages(el)) return;
+      const r = el.getBoundingClientRect();
+      if (r.height < 120) return;
+      if (!listboxCandidates.includes(el)) listboxCandidates.push(el);
+    };
+    document.querySelectorAll('div[role="listbox"], [role="listbox"]').forEach(pushCand);
+    document.querySelectorAll('[aria-label*="Messages" i]').forEach(pushCand);
+
+    for (const cand of listboxCandidates) {
+      if (isScrollable(cand)) return cand;
+      if (canScroll(cand)) return cand;   // right container, content not overflowing yet
+      // walk up: the wrapper that actually scrolls
+      let el = cand.parentElement;
+      for (let i = 0; i < 8 && el && el !== document.body; i++, el = el.parentElement) {
+        if (isScrollable(el) && !el.querySelector('a[href*="/direct/t/"]')) return el;
+      }
+      // walk down: some builds scroll an inner child
+      const inner = Array.from(cand.querySelectorAll('div, ul'))
+        .filter((e) => (isScrollable(e) || canScroll(e)) && !e.querySelector('a[href*="/direct/t/"]'))
+        .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+      if (inner) return inner;
+    }
+
+    /** Scroll container, or a scroll-capable box already holding several messages. */
+    const scrollsThread = (el) => {
+      if (!el) return false;
+      if (isScrollable(el)) return true;
+      if (!canScroll(el)) return false;
+      return el.querySelectorAll('[dir="auto"], img, audio, video').length >= 2;
+    };
+
+    // ── Signal 2: aria-label "Message" (singular) region ─────────────────────
+    for (const el of document.querySelectorAll('[aria-label*="Message" i]')) {
+      if (el.closest('[role="dialog"]')) continue;
+      if (!holdsMessages(el)) continue;
+      if (scrollsThread(el)) return el;
+    }
+
+    // ── Signal 3: nearest scrollable ancestor of the composer ────────────────
     if (composer) {
-      // Case A: the scroller is an ancestor of the composer.
       let el = composer.parentElement;
       for (let i = 0; i < 14 && el && el !== document.body; i++, el = el.parentElement) {
-        if (scrollable(el)) return el;
+        if (scrollsThread(el) && !el.querySelector('a[href*="/direct/t/"]')) return el;
       }
 
-      // Case B: the scroller is a SIBLING above the composer (most Instagram
-      // layouts put the composer outside the message list). Pick the scrollable
-      // element whose box ends near the composer and that holds message text.
+      // ── Signal 4: sibling scrollable above the composer ────────────────────
       let node = composer.parentElement;
       for (let depth = 0; depth < 6 && node && node !== document.body; depth++, node = node.parentElement) {
         const cands = Array.from(node.querySelectorAll('div, section, ul, main'))
-          .filter((el) => el !== node && !el.contains(composer) && scrollable(el))
+          .filter((el) => el !== node && !el.contains(composer))
           .filter((el) => {
+            if (!scrollsThread(el) || !holdsMessages(el)) return false;
             const r = el.getBoundingClientRect();
             if (r.height < 120) return false;
-            // ends at/above the composer
-            if (r.bottom > composerTop + 8) return false;
-            // must look like a message area
-            return el.querySelectorAll('[dir="auto"], img, audio, video').length >= 2;
+            return r.bottom <= composerTop + 8;
           });
         if (cands.length) {
-          // prefer the one with the most scrollable overflow (the real list)
           cands.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
           return cands[0];
         }
       }
-
-      // Case C: not scrollable at all (short thread) — use the composer's biggest
-      // sibling container so row resolution stays stable.
-      let box = composer.parentElement;
-      for (let i = 0; i < 6 && box && box.parentElement && box !== document.body; i++) {
-        const r = box.getBoundingClientRect();
-        if (r.height > 200) break;
-        box = box.parentElement;
-      }
-      if (box) return box;
     }
 
-    // Last resort: the biggest scrollable region on the page that holds text.
+    // ── Signal 5: biggest scrollable region holding message-like content ─────
     let best = null;
     let bestScore = 0;
     document.querySelectorAll('div, section, main, ul').forEach((el) => {
-      if (!scrollable(el)) return;
-      if (!el.querySelector('[dir="auto"]')) return;
-      const score = el.scrollHeight - el.clientHeight;
+      if (!scrollsThread(el) || !holdsMessages(el)) return;
+      if (el.closest('nav, [aria-label*="Chats" i], [aria-label*="Inbox" i]')) return;
+      // rank by overflow, then by how many messages it already holds
+      const score = (el.scrollHeight - el.clientHeight) +
+                    Math.min(60, el.querySelectorAll('[dir="auto"]').length * 10);
       if (score > bestScore && el.clientHeight > 150) { bestScore = score; best = el; }
     });
     return best;
+  }
+
+  /** Does this element look like a single message (text, photo, audio, reel…)? */
+  function looksLikeMessage(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.closest('[role="dialog"]')) return false;
+    if (el.querySelector('a[href*="/direct/t/"]')) return false;      // inbox row
+    const rect = el.getBoundingClientRect();
+    if (rect.height < 10 || rect.width < 40) return false;           // hidden measure node
+    const txt = (el.innerText || '').trim();
+    const media = el.querySelector('img, audio, video');
+    if (!txt && !media) return false;
+    // a message holds exactly ONE block of text (a container holds many)
+    const texts = el.querySelectorAll('[dir="auto"]');
+    if (texts.length > 2) return false;
+    if (rect.height > MAX_BUBBLE_HEIGHT) return false;
+    return true;
+  }
+
+  /**
+   * Find the repeating-children container that holds the messages.
+   *
+   * Instagram has removed role="row"/role="grid" from messages, so instead of
+   * trusting roles we look for the container whose CHILDREN each look like one
+   * message. That pattern survives class-name and role churn.
+   */
+  function findMessageRows(scroller) {
+    const root = scroller || document.body;
+    let best = null;
+    let bestScore = 0;
+
+    const containers = [root, ...root.querySelectorAll('div, ul, section')];
+    for (const c of containers) {
+      if (c.children.length < 2 || c.children.length > 400) continue;
+      // never harvest the conversation rail — it is visually message-shaped
+      if (c.closest('nav, [role="list"][aria-label*="Chats" i], [aria-label*="Chats" i], [aria-label*="Inbox" i], [aria-label*="Conversations" i]')) continue;
+      if (c.querySelector('a[href*="/direct/t/"]')) continue;
+      let good = 0;
+      for (const child of c.children) {
+        if (looksLikeMessage(child)) good++;
+      }
+      if (good < 2) continue;
+      // require the children to be mostly messages (not a wrapper of wrappers)
+      const ratio = good / c.children.length;
+      if (ratio < 0.5) continue;
+      const score = good + ratio * 10;
+      if (score > bestScore) { bestScore = score; best = c; }
+    }
+
+    if (best) {
+      return Array.from(best.children).filter(looksLikeMessage);
+    }
+    return [];
   }
 
   /** Is this node inside the conversation list / sidebar rather than the chat? */
@@ -652,6 +763,8 @@
     return false;
   }
 
+  const MAX_BUBBLE_HEIGHT = 520;
+
   const REACTION_ONLY = /^(?:\p{Extended_Pictographic}|\uFE0F|\u200D|\s)+$/u;
 
   /** Does this element hold a message body? (Avoids reacting to its buttons.) */
@@ -663,7 +776,6 @@
     return false;
   }
 
-  const MAX_BUBBLE_HEIGHT = 520;
 
   /**
    * Walk UP from a content element to the outermost ancestor that is still a
@@ -689,52 +801,66 @@
   }
 
   /** All message bubbles in the open conversation, top → bottom. */
+  /**
+   * All messages of the open conversation, top → bottom.
+   *
+   * Uses findMessageRows() (repeating-children pattern) first, then falls back to
+   * climbing from content nodes. Hidden duplicate render nodes are filtered out.
+   */
+  /**
+   * Instagram inserts date dividers ("October 25, 2026", "Yesterday 4:12 PM")
+   * as their own rows. Detect them by *shape*, never with `new Date(text)` —
+   * V8 happily parses "msg 0" as a 2001 date, which silently deleted every
+   * message starting with a short word + number.
+   */
+  const MONTH = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*';
+  const WEEKDAY = '(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*';
+  const DATE_SEPARATOR = new RegExp(
+    '^\\s*(?:' + WEEKDAY + '\\.?,?\\s+)?' + MONTH +
+    '\\s+\\d{1,2}(?:,?\\s+\\d{2,4})?(?:\\s*[·,]\\s*\\d{1,2}:\\d{2}\\s*[ap]\\.?m\\.?)?\\s*$' +
+    '|^\\s*\\d{1,2}:\\d{2}\\s*[ap]\\.?m\\.?\\s*$' +
+    '|^\\s*(?:yesterday|today)(?:\\s*[·,]?\\s*\\d{1,2}:\\d{2}\\s*[ap]\\.?m\\.?)?\\s*$' +
+    '|^\\s*\\d{1,2}/\\d{1,2}/\\d{2,4}\\s*$',
+    'i'
+  );
+  function isDateSeparator(txt) {
+    if (!txt) return false;
+    const clean = String(txt).replace(/\s+/g, ' ').trim();
+    if (clean.length > 40) return false;
+    return DATE_SEPARATOR.test(clean);
+  }
+
   function getBubbles() {
     const scroller = findThreadScroller();
-    const root = scroller || document.querySelector('main') || document.body;
-    const composer = findComposer();
+    let bubbles = findMessageRows(scroller);
 
-    // candidate content nodes inside the conversation
-    const seeds = Array.from(root.querySelectorAll(
-      '[dir="auto"], img, video, audio, [aria-label*="document" i], [aria-label*="file" i], [aria-label*="attachment" i]'
-    ))
-      .filter((n) => {
-        if (composer && (composer.contains(n) || n.contains(composer))) return false;
+    // ── fallback: climb from content nodes inside the scroller ────────────────
+    if (!bubbles.length) {
+      const root = scroller || document.querySelector('main') || document.body;
+      const seeds = Array.from(root.querySelectorAll(
+        '[dir="auto"], img, video, audio, [aria-label*="document" i], [aria-label*="file" i]'
+      )).filter((n) => {
         if (n.closest('[role="dialog"]')) return false;
-        if (inInbox(n, scroller)) return false;
+        if (n.querySelector('a[href*="/direct/t/"]')) return false;
         if (n.closest('a[href*="/direct/t/"]')) return false;
-        // ignore header text, buttons and labels
-        if (n.closest('button, [role="button"], header, [aria-label*="Message" i][role="textbox"]')) return false;
         const r = n.getBoundingClientRect();
-        if (r.width < 4 || r.height < 4) return false;
-        return true;
+        return r.width > 4 && r.height > 4;
       });
+      bubbles = seeds.map((n) => climbToBubble(n, root));
+      bubbles = bubbles.filter((b, i, arr) => !arr.some((o) => o !== b && o.contains(b)));
+    }
 
-    // climb each seed to a whole-bubble element, then de-duplicate
-    let bubbles = seeds.map((n) => climbToBubble(n, root));
-
-    // collapse nested/duplicate bubbles, keep the outermost
-    bubbles = bubbles.filter((b, i, arr) => !arr.some((o) => o !== b && o.contains(b)));
-
-    // drop hidden measure nodes and reaction-only pills
+    // ── shared filtering ─────────────────────────────────────────────────────
     bubbles = bubbles.filter((b) => {
       if (isHiddenRow(b)) return false;
       if (!hasMessageContent(b)) return false;
       const txt = (b.innerText || '').trim();
       if (txt && REACTION_ONLY.test(txt) && !b.querySelector('img, audio, video')) return false;
-      const r = b.getBoundingClientRect();
-      if (r.height < 8) return false;
+      if (isDateSeparator(txt)) return false;
       return true;
     });
 
-    // sort by vertical position → true chronological order on screen
-    bubbles.sort((a, b) => {
-      const ra = a.getBoundingClientRect();
-      const rb = b.getBoundingClientRect();
-      return ra.top - rb.top || ra.left - rb.left;
-    });
-
-    // remove exact visual duplicates (same text, same top, same kind)
+    // de-duplicate nested + visually identical nodes
     const seen = new Set();
     const out = [];
     for (const b of bubbles) {
@@ -744,6 +870,11 @@
       seen.add(key);
       out.push(b);
     }
+
+    out.sort((a, b) => {
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      return ra.top - rb.top || ra.left - rb.left;
+    });
     return { bubbles: out, scroller };
   }
 
@@ -1250,14 +1381,48 @@
     return fresh;
   }
 
-  /** Nudge the scroller so Instagram's "load older messages" hook fires. */
+  /**
+   * Poke Instagram's "load older messages" hook.
+   *
+   * Simply sitting at scrollTop 0 often does not trigger it, so we oscillate a
+   * little and repeat. This is what makes the history walk reliable.
+   */
+  /**
+   * Fire every signal a lazy-loader might listen for at the top edge: real
+   * scrollTop movement, a synthetic `scroll` event (needed when the box is not
+   * overflowing, so scrollTop cannot change), and a wheel event. Returns true
+   * if the rendered message count or scrollHeight grew.
+   */
+  async function coaxMore(scroller, tries) {
+    const before = snapshotOf(scroller);
+    for (let i = 0; i < (tries || 3); i++) {
+      try { scroller.scrollTop = 0; } catch (_) {}
+      try { scroller.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+      try {
+        const r = scroller.getBoundingClientRect();
+        scroller.dispatchEvent(new WheelEvent('wheel', {
+          bubbles: true, cancelable: true, deltaY: -600, deltaMode: 0,
+          clientX: Math.round(r.left + r.width / 2), clientY: Math.round(r.top + 40),
+        }));
+      } catch (_) {}
+      await sleepScroll(650);
+      if (snapshotOf(scroller) !== before) return true;
+    }
+    return false;
+  }
+
+  function snapshotOf(el) {
+    return el.scrollHeight + ':' + el.querySelectorAll('[dir="auto"]').length;
+  }
+
   async function nudgeForMore(scroller) {
-    const prev = scroller.scrollTop;
-    scroller.scrollTop = Math.min(60, Math.max(20, scroller.clientHeight * 0.05));
-    await sleepScroll(120);
-    scroller.scrollTop = 0;
-    await sleepScroll(CONFIG.SCROLL_SETTLE_MS + 120);
-    if (prev > 0 && scroller.scrollTop === 0 && prev !== 0) { /* fine */ }
+    for (let i = 1; i <= 3; i++) {
+      scroller.scrollTop = Math.round(60 * i);       // move down a bit
+      await sleepScroll(120);
+      scroller.scrollTop = 0;                        // slam back to the top
+      await sleepScroll(380);
+      if (scroller.scrollHeight > 0) return;
+    }
   }
 
   /** Everything currently rendered, in top→bottom order (no scrolling needed). */
@@ -1339,9 +1504,17 @@
       if (found) {
         WARN('backfill: wrapper does not scroll — using the real list container');
         useScroller = found;
-      } else {
-        // short conversation: nothing to scroll, just read what is rendered
-        WARN('backfill: conversation does not scroll — reading visible messages');
+      }
+    }
+
+    // Even when nothing overflows yet, Instagram loads older messages on a
+    // scroll/wheel signal at the top edge. Coax it before giving up, otherwise
+    // an idle thread is mistaken for "this is the whole conversation".
+    if (useScroller.scrollHeight <= useScroller.clientHeight + 12) {
+      WARN('backfill: transcript fits the screen — coaxing the loader');
+      const grew = await coaxMore(useScroller, 4);
+      if (!grew) {
+        WARN('backfill: no more history — reading visible messages');
         return harvestRendered();
       }
     }
@@ -1379,32 +1552,43 @@
       trace('up step', steps, 'top=' + Math.round(useScroller.scrollTop),
             'h=' + useScroller.scrollHeight, 'fresh=' + fresh.length, 'total=' + collected.length);
 
-      const atTop = useScroller.scrollTop <= 2;
-      const grew = useScroller.scrollHeight !== lastHeight;
-      lastHeight = useScroller.scrollHeight;
+      const heightBefore = useScroller.scrollHeight;
+      const grew = heightBefore !== lastHeight;
+      const atZero = useScroller.scrollTop <= 2;
+      lastHeight = heightBefore;
 
       if (onProgress) onProgress(collected.length, steps, useScroller.scrollTop);
+      trace('   top=' + Math.round(useScroller.scrollTop), 'h=' + heightBefore,
+            'grew=' + grew, 'fresh=' + fresh.length, 'idle=' + idleAtTop);
 
-      trace('   atTop=' + atTop, 'grew=' + grew, 'idle=' + idleAtTop);
-      if (atTop) {
-        if (fresh.length || grew) { idleAtTop = 0; continue; }
-        idleAtTop++;
-        if (idleAtTop > CONFIG.SCROLL_TOP_GRACE) break;
-        // nothing new: actively poke the "load older" hook, then look again
-        await nudgeForMore(useScroller);
-        const more = harvestNew(seen, useScroller);
-        if (more.length) {
-          collected = more.concat(collected);
-          idleAtTop = 0;
-          lastHeight = useScroller.scrollHeight;
-        }
-      } else if (before === useScroller.scrollTop && !grew && !fresh.length) {
-        idleAtTop++;
-        if (idleAtTop > CONFIG.SCROLL_TOP_GRACE) break;
-        await nudgeForMore(useScroller);
-      } else {
+      // Still walking upward — keep going.
+      if (!atZero) { idleAtTop = 0; continue; }
+
+      // We are at scrollTop 0. That is NOT necessarily the first message: the
+      // transcript lazy-loads older history. Poke it and see if anything appears.
+      if (fresh.length) { idleAtTop = 0; continue; }
+
+      await nudgeForMore(useScroller);
+      const more = harvestNew(seen, useScroller);
+      const heightAfter = useScroller.scrollHeight;
+
+      if (more.length) collected = more.concat(collected);
+
+      const loadedMore = heightAfter > heightBefore + 4 || more.length > 0;
+      if (loadedMore) {
         idleAtTop = 0;
+        lastHeight = heightAfter;
+        trace('   lazy-loaded more; h=' + heightAfter + ' fresh=' + more.length);
+        continue;                       // new rows rendered → keep going up
       }
+
+      idleAtTop++;
+      trace('   nothing more at top (idle=' + idleAtTop + ')');
+      if (idleAtTop > CONFIG.SCROLL_TOP_GRACE) {
+        trace('   reached the real top');
+        break;
+      }
+      await sleepScroll(250);
     }
 
     // ── Phase 2: canonical order pass ────────────────────────────────────────
@@ -1533,15 +1717,16 @@
       const { bubbles } = getBubbles();
       STATE.lastRows = bubbles.length;
       if (!bubbles.length) {
-        hud('⏳ Waiting for messages to render…', 'warn');
+        reportStarved();
         return;
       }
 
       const items = bubbles.map(extractRow).filter((i) => !isJunkItem(i));
       if (!items.length) {
-        hud('⏳ Waiting for messages to render…', 'warn');
+        reportStarved();
         return;
       }
+      STATE.starvedSince = 0;
       await syncItems(items);
 
     } catch (e) {
@@ -1554,6 +1739,27 @@
     } finally {
       STATE.scanning = false;
     }
+  }
+
+  /**
+   * Shown when nothing was detected. Instead of a dead-end "waiting" pill it
+   * states WHY, so the fix is obvious from the badge alone.
+   */
+  function reportStarved() {
+    STATE.starvedSince = STATE.starvedSince || nowMs();
+    const waited = Math.round((nowMs() - STATE.starvedSince) / 1000);
+    const sc = findThreadScroller();
+    const composer = findComposer();
+    let why;
+    if (!composer) why = 'no message box found — open the chat itself';
+    else if (!sc) why = 'no conversation panel found — try Desktop site';
+    else {
+      const region = sc.querySelectorAll('[dir="auto"], img, video, audio').length;
+      why = region
+        ? 'found ' + region + ' items but none looked like a message'
+        : 'the conversation panel is empty — scroll up a little';
+    }
+    hud('⏳ Waiting (' + waited + 's) · ' + why, 'warn');
   }
 
   /** Scroll the whole conversation once, then push everything in chat order. */
@@ -1756,6 +1962,45 @@
     window.addEventListener('focus', () => { if (STATE.ready) scan(); });
     window.addEventListener('online', () => { if (STATE.ready) scan(); });
   }
+
+  /* ── Debug handle ─────────────────────────────────────────────────────────
+   * Lets you (and me) inspect detection from the phone's console or via
+   * `copy(JSON.stringify(__relayDebug.snapshot()))`. Harmless to leave in. */
+  try {
+    window.__relayDebug = {
+      version: VERSION,
+      scroller: () => findThreadScroller(),
+      composer: () => findComposer(),
+      rows: () => findMessageRows(findThreadScroller()),
+      bubbles: () => getBubbles().bubbles,
+      snapshot() {
+        const sc = findThreadScroller();
+        const rows = findMessageRows(sc);
+        return {
+          version: VERSION,
+          url: location.pathname,
+          thread: chatIdFromUrl(),
+          target: CONFIG.TARGET_CHAT_ID,
+          composer: !!findComposer(),
+          scroller: sc ? {
+            tag: sc.tagName,
+            role: sc.getAttribute('role'),
+            label: sc.getAttribute('aria-label'),
+            h: sc.scrollHeight, ch: sc.clientHeight,
+            scrollable: sc.scrollHeight > sc.clientHeight + 12,
+          } : null,
+          rowsFound: rows.length,
+          bubblesFound: getBubbles().bubbles.length,
+          firstTexts: rows.slice(0, 4).map((r) => (r.innerText || '').trim().slice(0, 40)),
+          listboxes: Array.from(document.querySelectorAll('[role="listbox"]')).map((e) => ({
+            label: e.getAttribute('aria-label'), kids: e.children.length,
+            h: e.scrollHeight, ch: e.clientHeight,
+          })),
+          state: { ready: STATE.ready, paused: STATE.paused, wrote: STATE.wrote, transport: STATE.transport },
+        };
+      },
+    };
+  } catch (_) {}
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot, { once: true });

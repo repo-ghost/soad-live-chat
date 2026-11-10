@@ -358,9 +358,26 @@ Two things you *should* change on the phone:
 | Reel thumbnails 403 | keep `<meta name="referrer" content="no-referrer">` in `<head>` (already set) |
 | Duplicate-looking history | the relay only pushes rows it has not seen; a fresh bootstrap on an empty DB is expected to push everything once |
 | Relay stops after switching chats | by design — reopen the target thread and it resumes automatically |
+| **Pill stuck on "Waiting for messages to render…"** | v2.1.0 names the reason in the pill itself (no message box / no panel / panel empty). Reinstall the script, then **delete the `messages` node** and reload the chat |
 | **New profile photo does not appear** | GitHub Pages cached the old bytes — bump `ICON_VERSION` in `index.html` (see [§4](#profile-pictures)), then hard-refresh with Ctrl/Cmd+Shift+R |
 | **Forgot the login** | regenerate with `node tools/make-login.js <user> <pass>` and commit (see [§7](#7-login-gate)) |
 | **Gate won't accept the right password** | passwords are case-sensitive and it must be the *digest* you pasted — re-run `node tools/make-login.js` to be sure |
+
+### Why v2.1.0 suddenly "sees" messages again
+
+Instagram quietly **deleted `role="grid"` and `role="row"` from Direct messages**. Every
+detector that looked for those attributes matched nothing, so the relay reported
+*"Waiting for messages to render…"* forever and backfill never scrolled. v2.1.0 keys on
+structure instead:
+
+- transcript = the `[role="listbox"]` region (or `[aria-label*="Messages"]`),
+- messages = whichever container's **children each look like one message**,
+- date dividers are matched by *pattern* — never `new Date(text)`, because JavaScript will
+  happily parse ordinary words as a date and silently discard real messages,
+- a chat that fits on screen is still a valid container, so the relay nudges it to load more.
+
+If a future Instagram update breaks it again, `__relayDebug.snapshot()` in the console prints
+exactly what the script sees.
 
 ### How catch-up avoids duplicates
 
