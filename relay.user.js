@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IG Direct → Live Mirror Relay (read-only)
 // @namespace    https://github.com/orin/soad-live-chat
-// @version      2.2.0
+// @version      2.3.0
 // @description  Mirrors ONE Instagram Direct thread to Firebase Realtime Database for a public read-only page. Client-side DOM observation only — no login automation, no private APIs. Mobile (Firefox for Android) friendly.
 // @author       Orin
 // @downloadURL  https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js
@@ -107,7 +107,7 @@
    * 2. INTERNALS
    * =================================================================================== */
 
-  const VERSION = '2.2.0';
+  const VERSION = '2.3.0';
   const DB = String(CONFIG.FIREBASE_DB_URL).replace(/\/+$/, '');
   const LOG = (...a) => console.log('%c[relay]', 'color:#A800FF;font-weight:700', ...a);
   const WARN = (...a) => console.warn('%c[relay]', 'color:#ff9f0a;font-weight:700', ...a);
@@ -126,6 +126,7 @@
     looseDedupe: false,    // sticky fallback: dedupe by signature instead of alignment
     backfilled: false,     // one-time full-history read has run
     resetPushed: false,    // manual "start at the first message" was completed
+    holdScansUntil: 0,     // scan() stands down until this moment
     inManualBackfill: false,
     // diagnostics
     transport: 'unknown',  // 'gm' | 'fetch'
@@ -197,7 +198,7 @@
     jumpBtn = document.createElement('div');
     jumpBtn.id = 'ig-relay-jump';
     jumpBtn.textContent = '⬆';
-    jumpBtn.title = 'Go to the first message and re-sync the whole chat';
+    jumpBtn.title = 'Tap: jump to the first message and re-sync · long-press: copy a page report';
     jumpBtn.setAttribute(
       'style',
       [
@@ -211,10 +212,35 @@
         'cursor:pointer', 'user-select:none', 'touch-action:manipulation',
       ].join(';')
     );
-    // stop our own tap from reaching Instagram's handlers underneath
+    // Tap  = jump to the first message and re-sync.
+    // Long-press (600 ms) = show/copy a report of what the page looks like, which
+    // is the only reliable way to debug a real Instagram DOM from a phone.
+    let pressTimer = null;
+    let longPressed = false;
+
+    const beginPress = (ev) => {
+      longPressed = false;
+      pressTimer = setTimeout(() => {
+        longPressed = true;
+        try { if (ev.cancelable) ev.preventDefault(); } catch (_) {}
+        copyDomReport();
+      }, 600);
+    };
+    const endPress = () => {
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+    };
+
+    jumpBtn.addEventListener('pointerdown', beginPress);
+    jumpBtn.addEventListener('pointerup', endPress);
+    jumpBtn.addEventListener('pointercancel', endPress);
+    jumpBtn.addEventListener('pointerleave', endPress);
+    jumpBtn.addEventListener('contextmenu', (ev) => ev.preventDefault());
+
     jumpBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
+      endPress();
+      if (longPressed) { longPressed = false; return; }   // long-press already handled
       startManualBackfill();
     });
     document.documentElement.appendChild(jumpBtn);
@@ -246,50 +272,86 @@
     setJumpButtonBusy(true, '…');
 
     try {
-      // ── 1. find the conversation before touching the database ──────────────
-      hud('⬆ Looking for the first message…');
+      // ── 1. COLLECT first, wipe afterwards ─────────────────────────────────
+      // Destructive-then-hope was the old order: if the read came back with a
+      // handful of rows we had already deleted everything. Now the database is
+      // only touched once a full history is actually in hand.
+      hud('⬆ Finding the first message…');
       const jump = await jumpToFirstMessage((count, round, grew) => {
         hud('⬆ Scrolling to the first message… ' + count + ' items (round ' + round + ')');
         setJumpButtonBusy(true, grew ? '⬆' : '…');
       });
 
       if (!jump.ok) {
-        hud('⚠️ ' + (jump.reason || 'could not reach the top') + ' · tap for details', 'bad');
         STATE.lastError = 'jump: ' + (jump.reason || 'unknown');
+        hud('⚠️ ' + (jump.reason || 'could not reach the top') + ' · tap for details', 'bad');
+        return;
+      }
+      if (!getBubbles().bubbles.length) {
+        hud('⚠️ No messages visible · long-press ⬆ for a report', 'bad');
         return;
       }
 
-      const bubbles = getBubbles().bubbles;
-      if (!bubbles.length) {
-        // Refuse to wipe: with nothing readable we would destroy good data.
-        hud('⚠️ No messages visible — not clearing the database', 'bad');
+      hud('📜 Reading the whole history…');
+      const all = await backfillAll((collected) => {
+        hud('📜 Reading history… ' + collected + ' messages');
+      });
+
+      if (!all || !all.length) {
+        STATE.lastError = 'backfill returned nothing';
+        hud('⚠️ Could not read history · DB left untouched', 'bad');
+        return;
+      }
+      if (all.length < MIN_HISTORY_TO_WIPE) {
+        hud('⚠️ Only ' + all.length + ' messages found (' + MIN_HISTORY_TO_WIPE +
+            ' needed) · DB left untouched', 'bad');
         return;
       }
 
-      // ── 2. clear, then write the full history in order ─────────────────────
+      // ── 2. now it is safe to replace the database ─────────────────────────
       hud('🧹 Clearing old copy…');
       try {
-        await fbRequest('DELETE', '.json');
+        await clearMessagesNode();
       } catch (e) {
-        WARN('could not clear messages node', e.message);
-        hud('⚠️ Could not clear the database · check write rules', 'bad');
+        STATE.lastError = 'clear: ' + e.message;
+        hud('⚠️ Could not clear the database · tap for details', 'bad');
         return;
       }
       STATE.tail = [];
       STATE.reactions.clear();
       STATE.looseDedupe = false;
-      STATE.wrote = 0;
       STATE.resetPushed = false;
+      STATE.wrote = 0;                     // the DB really is empty again
 
-      const saved = await runBackfill();   // flag stays set: scan() keeps out
-      setJumpButtonBusy(false);
+      // ── 3. write oldest → newest ──────────────────────────────────────────
+      let n = 0;
+      for (const item of all) {
+        try {
+          await pushItem(item);
+          n++;
+          if (n % 3 === 0) hud('⬆ Saving history… ' + n + '/' + all.length);
+        } catch (e) {
+          WARN('history push failed', e.message);
+          STATE.lastError = e.message;
+          await sleep(400);
+        }
+        await sleep(CONFIG.POST_DELAY_MS);
+      }
+      STATE.resetPushed = true;
 
-      if (saved) {
-        hud('✅ Saved all ' + saved + ' messages · back to live', 'ok');
-        await sleep(1400);
+      if (n) {
+        hud('✅ Saved all ' + n + ' messages · back to live', 'ok');
+        // return the reader to the newest message, then let live sync resume
+        try {
+          const sc = findThreadScroller();
+          if (sc) { sc.scrollTop = sc.scrollHeight; fireScrollHints(sc, 1); }
+        } catch (_) {}
+        STATE.holdScansUntil = nowMs() + 2500;
+        await sleep(2000);
+        STATE.inManualBackfill = false;
         scan();
       } else {
-        hud('⚠️ Found messages but nothing saved · tap for details', 'bad');
+        hud('⚠️ Nothing could be saved · tap for details', 'bad');
       }
     } catch (e) {
       WARN('manual backfill failed', e);
@@ -299,6 +361,28 @@
       STATE.inManualBackfill = false;
       setJumpButtonBusy(false);
     }
+  }
+
+  /** Below this, treat a "full read" as a failure and never delete anything. */
+  const MIN_HISTORY_TO_WIPE = 2;
+
+  /**
+   * Empty the messages node using *child* deletes. A `messages: {".write": true}`
+   * rule allows child writes but can refuse a delete of the node itself, and a
+   * failed DELETE used to abort the refresh silently.
+   */
+  async function clearMessagesNode() {
+    if (STATE.tail.length) {
+      const patches = {};
+      STATE.tail.forEach(({ key }) => { patches[key] = null; });
+      await fbRequest('PATCH', '.json', patches);
+      return;
+    }
+    const existing = await fbRequest('GET', '.json?shallow=true');
+    if (!existing || typeof existing !== 'object') return;
+    const patches = {};
+    Object.keys(existing).forEach((k) => { patches[k] = null; });
+    if (Object.keys(patches).length) await fbRequest('PATCH', '.json', patches);
   }
 
   function hud(text, tone) {
@@ -393,6 +477,8 @@
     ];
 
     if (STATE.lastError) lines.push('', `last error    : ${STATE.lastError}`);
+    lines.push('', '── report · long-press ⬆ to copy ──');
+    try { lines.push(domReport()); } catch (e) { lines.push('report failed: ' + e.message); }
     if (diag) lines.push('', `⚠️ ${diag.title}`, diag.hint);
 
     panelEl.innerHTML =
@@ -407,8 +493,100 @@
         .join('\n') +
       `<div style="margin-top:10px;padding-top:9px;border-top:1px solid #2a2a2a;color:#888;font-family:system-ui">
          <b style="color:#c084fc">⬆ button</b> = jump to the first message and re-sync everything.<br>
+         <b style="color:#c084fc">Long-press ⬆</b> = copy a report of what the page looks like.<br>
          Tap the pill to close.
        </div>`;
+  }
+
+  /**
+   * A one-tap description of the real page. Built because a phone has no console:
+   * the ⬆ button long-press copies this, and it is also shown in the panel.
+   */
+  function domReport() {
+    const sc = findThreadScroller();
+    const composer = findComposer();
+    const bubbles = (() => { try { return getBubbles().bubbles; } catch (_) { return []; } })();
+    const lines = [];
+    lines.push('IG RELAY ' + VERSION);
+    lines.push('url: ' + location.pathname);
+    lines.push('thread: ' + (chatIdFromUrl() || 'none') + ' / target ' + CONFIG.TARGET_CHAT_ID);
+    lines.push('composer: ' + (composer ? 'FOUND' : 'NOT FOUND'));
+    if (sc) {
+      lines.push('transcript: ' + sc.tagName.toLowerCase() +
+        (sc.getAttribute('role') ? '[role=' + sc.getAttribute('role') + ']' : '') +
+        (sc.getAttribute('aria-label') ? '[aria-label=' + sc.getAttribute('aria-label') + ']' : '') +
+        ' h=' + sc.scrollHeight + ' ch=' + sc.clientHeight + ' top=' + Math.round(sc.scrollTop));
+    } else {
+      lines.push('transcript: NOT FOUND');
+    }
+    lines.push('bubbles detected: ' + bubbles.length);
+    lines.push('text nodes ([dir=auto]): ' + document.querySelectorAll('[dir="auto"]').length);
+    lines.push('listboxes: ' + document.querySelectorAll('[role="listbox"]').length);
+    lines.push('imgs total: ' + document.querySelectorAll('img').length);
+
+    // the scrollable boxes, biggest first — this is what the detector picks from
+    const boxes = [];
+    document.querySelectorAll('div, main, section, ul').forEach((el) => {
+      try {
+        const st = getComputedStyle(el);
+        if (!/(auto|scroll)/.test(st.overflowY)) return;
+        if (el.scrollHeight < 150) return;
+        const r = el.getBoundingClientRect();
+        if (r.width < 80 || r.height < 80) return;
+        boxes.push({
+          label: (el.getAttribute('aria-label') || el.getAttribute('role') || el.tagName).slice(0, 24),
+          over: el.scrollHeight - el.clientHeight,
+          kids: el.children.length,
+          texts: el.querySelectorAll('[dir="auto"]').length,
+          imgs: el.querySelectorAll('img').length,
+        });
+      } catch (_) {}
+    });
+    boxes.sort((a, b) => b.over - a.over);
+    lines.push('');
+    lines.push('scroll boxes (label | overflow | children | texts | imgs):');
+    boxes.slice(0, 5).forEach((b) => {
+      lines.push('  ' + b.label + ' | ' + b.over + 'px | ' + b.kids + ' | ' + b.texts + ' | ' + b.imgs);
+    });
+    if (!boxes.length) lines.push('  (none — nothing on this page scrolls)');
+
+    // what the first few detected messages actually are
+    lines.push('');
+    lines.push('first detected:');
+    bubbles.slice(0, 5).forEach((b, i) => {
+      const r = b.getBoundingClientRect();
+      lines.push('  ' + i + ': "' + (b.innerText || '').replace(/\n/g, ' ').slice(0, 34) +
+        '" ' + Math.round(r.width) + 'x' + Math.round(r.height));
+    });
+    if (!bubbles.length) lines.push('  (nothing detected)');
+    return lines.join('\n');
+  }
+
+  async function copyDomReport() {
+    const text = domReport();
+    let copied = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      }
+    } catch (_) {}
+    if (!copied) {
+      // clipboard API is often blocked on mobile — fall back to a selectable box
+      const box = document.createElement('textarea');
+      box.value = text;
+      box.setAttribute('style',
+        'position:fixed;left:6px;right:6px;top:6px;height:38vh;z-index:2147483647;' +
+        'background:#000;color:#0f0;font:11px ui-monospace,monospace;border:2px solid #A800FF;' +
+        'border-radius:10px;padding:8px;white-space:pre;overflow:auto');
+      document.documentElement.appendChild(box);
+      box.focus();
+      box.select();
+      setTimeout(() => { try { box.remove(); } catch (_) {} }, 30000);
+    }
+    hud(copied ? '📋 Report copied' : '📋 Report shown — select & copy it', 'ok');
+    STATE.lastReport = text;
+    return text;
   }
 
   function safeRowCount() {
@@ -853,7 +1031,8 @@
     const rect = el.getBoundingClientRect();
     if (rect.height < 10 || rect.width < 40) return false;           // hidden measure node
     const txt = (el.innerText || '').trim();
-    const media = el.querySelector('img, audio, video');
+    const media = el.querySelector('audio, video') ||
+      Array.from(el.querySelectorAll('img')).find((im) => !isLikelyAvatarImg(im));
     if (!txt && !media) return false;
     // a message holds exactly ONE block of text (a container holds many)
     const texts = el.querySelectorAll('[dir="auto"]');
@@ -926,7 +1105,9 @@
 
   /** Does this element hold a message body? (Avoids reacting to its buttons.) */
   function hasMessageContent(el) {
-    if (el.querySelector('[dir="auto"], img, video, audio')) return true;
+    if (el.querySelector('[dir="auto"], video, audio')) return true;
+    // an avatar alone is not a message — only a real inline picture counts
+    if (Array.from(el.querySelectorAll('img')).some((im) => !isLikelyAvatarImg(im))) return true;
     if (el.querySelector('a[href*="/reel/"], a[href*="/reels/"], a[href*="/p/"], a[href*="/tv/"]')) return true;
     // attachment / document cards have text but often no [dir="auto"]
     if (/\.(pdf|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|apk)\b/i.test(el.innerText || '')) return true;
@@ -1035,11 +1216,7 @@
     return { bubbles: out, scroller };
   }
 
-  const isLikelyAvatar = (img) => {
-    const r = img.getBoundingClientRect();
-    const w = Math.max(r.width, img.naturalWidth || 0);
-    return w > 0 && w < 70;
-  };
+  const isLikelyAvatar = (img) => isLikelyAvatarImg(img);
 
   /** "Me" = row rendered right-to-left (row-reverse wrapper), with a geometry fallback. */
   function isMine(row) {
@@ -1247,10 +1424,44 @@
     return Array.from(links.entries()).map(([url, thumb]) => ({ url, thumb }));
   }
 
+  /**
+   * Is this image somebody's profile picture rather than a shared photo?
+   *
+   * Critical detail: Instagram renders an in-thread avatar at 24×24 but the file
+   * it points at is a 150×150 scontent thumbnail. Testing `naturalWidth` — as an
+   * earlier version did via Math.max() — therefore treated EVERY avatar as a real
+   * photo, and the relay inlined the same profile picture over and over, turning
+   * text messages into "photos".
+   *
+   * So: judge by what is on screen, plus explicit avatar markers.
+   */
+  const AVATAR_ALT = /(profile picture|profile photo|user avatar|^avatar$|\bavatar\b)/i;
+  const AVATAR_PATH = /\/(?:profile_pic|avatar|pfp)[\w.-]*/i;
+
   const isLikelyAvatarImg = (img) => {
+    if (!img) return true;
+    // 1. Instagram literally labels them
+    const alt = img.getAttribute('alt') || '';
+    if (AVATAR_ALT.test(alt)) return true;
+    for (const attr of ['aria-label', 'title']) {
+      const v = img.getAttribute(attr);
+      if (v && AVATAR_ALT.test(v)) return true;
+    }
+    // 2. explicit avatar URL shapes (avatars are CDN thumbs, never /p/ media)
+    const src = img.getAttribute('src') || '';
+    if (AVATAR_PATH.test(src)) return true;
+    // 3. size as rendered on screen — NOT naturalWidth
     const r = img.getBoundingClientRect();
-    const w = Math.max(r.width, img.naturalWidth || 0);
-    return w > 0 && w < 72;
+    const rendered = Math.max(r.width, r.height);
+    if (rendered > 0 && rendered < 72) return true;
+    if (rendered === 0) return true;                 // not visible at all
+    // 4. square, tiny natural file in a narrow wrapper
+    const natW = img.naturalWidth || 0;
+    const natH = img.naturalHeight || 0;
+    if (natW && natW === natH && natW <= 160 && rendered <= 96) return true;
+    // 5. a picture sitting inside an avatar-ring wrapper
+    if (img.closest('[class*="avatar" i], [aria-label*="avatar" i], [alt*="avatar" i]')) return true;
+    return false;
   };
 
   /** Extract one bubble into a normalised message record. */
@@ -1960,7 +2171,10 @@
 
     // A history read owns the conversation while it runs: its own pointers, its
     // own seen-sets. Syncing on top of it is what duplicated rows (104 for 36).
+    // Keep standing down for a moment AFTER it finishes, because it leaves the
+    // transcript parked at the oldest message.
     if (backfillLock || STATE.inManualBackfill) return;
+    if (STATE.holdScansUntil && nowMs() < STATE.holdScansUntil) return;
 
     STATE.scanning = true;
     STATE.paused = false;

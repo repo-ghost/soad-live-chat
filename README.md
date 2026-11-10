@@ -359,11 +359,30 @@ Two things you *should* change on the phone:
 | Duplicate-looking history | the relay only pushes rows it has not seen; a fresh bootstrap on an empty DB is expected to push everything once |
 | Relay stops after switching chats | by design — reopen the target thread and it resumes automatically |
 | **Pill stuck on "Waiting for messages to render…"** | v2.2.0 names the reason in the pill itself. Tap the pill and read the *"what the page looks like"* block — it lists composer, transcript, text nodes, listboxes and scroll boxes. Then press **⬆** |
-| **Nothing saves / DB empty** | press **⬆**. If it still fails, the panel tells you whether the composer or the transcript was found at all |
+| **Nothing saves / DB empty** | press **⬆**. If it still fails, long-press **⬆** and send the report — it says whether the composer and transcript were found at all |
+| **Profile pictures saved as message photos** | fixed in v2.3.0 — update the userscript, then press **⬆** once to rebuild the node cleanly |
 | **Rows duplicated** | press **⬆** — it clears the node first. (Fixed in v2.2.0; older versions could double-write) |
 | **New profile photo does not appear** | GitHub Pages cached the old bytes — bump `ICON_VERSION` in `index.html` (see [§4](#profile-pictures)), then hard-refresh with Ctrl/Cmd+Shift+R |
 | **Forgot the login** | regenerate with `node tools/make-login.js <user> <pass>` and commit (see [§7](#7-login-gate)) |
 | **Gate won't accept the right password** | passwords are case-sensitive and it must be the *digest* you pasted — re-run `node tools/make-login.js` to be sure |
+
+### Why profile pictures were being saved as messages
+
+Instagram renders an in-thread avatar at **24×24 px**, but the file it points at is a
+**150×150** CDN thumbnail. The old avatar filter measured
+`Math.max(renderedWidth, naturalWidth)`, so every avatar scored 150 → "a real photo".
+The relay then inlined the same profile picture over and over and turned ordinary text
+messages into photo messages (26 of 36 in a test thread).
+
+Fixed in v2.3.0 by judging what is *on screen* plus explicit markers:
+
+- `alt` / `aria-label` / `title` containing "profile picture", "avatar", "user avatar"
+- avatar-shaped URLs (`/profile_pic`, `/avatar`, `/pfp`)
+- rendered size under 72 px, or not visible at all
+- a small square file inside a narrow wrapper
+
+An avatar also no longer counts as "this row has content", so a text message can never be
+promoted to a photo again.
 
 ### The ⬆ button — jump to the first message
 
@@ -372,9 +391,15 @@ the DB is empty, half-filled, or you just want the chat rebuilt from message #1:
 
 1. it scrolls the conversation all the way up, nudging Instagram's lazy loader
    (scroll + wheel + touch events) until the transcript stops growing;
-2. it **deletes the `messages` node** — but only after it can actually see messages,
-   so a failed read can never wipe good data;
-3. it re-writes the entire history oldest → newest, with the usual 80 ms spacing.
+2. it reads the **whole** history;
+3. only then does it clear the `messages` node, and only if at least 2 messages came
+   back — collect, verify, wipe, write. A failed read can never destroy good data;
+4. it re-writes the entire history oldest → newest, with the usual 80 ms spacing.
+
+**Long-press** the button (600 ms) to copy a *page report* into a text box on screen:
+composer state, transcript size, detected bubbles, and the scroll containers it can
+choose from. That report is what makes a real Instagram bug diagnosable from a phone —
+send it whenever something misbehaves.
 
 While it runs, normal scanning is suspended: two writers racing on the same thread
 was producing duplicated rows (104 rows for 36 messages). Only one history read can
