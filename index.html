@@ -984,6 +984,10 @@
   /* ════════════════════════════════════════════════════════════════════
    *  5. Boot
    * ═══════════════════════════════════════════════════════════════════ */
+  // Trim any trailing slash so "…firebasedatabase.app/" and "…app" both work.
+  if (FIREBASE_CONFIG.databaseURL){
+    FIREBASE_CONFIG.databaseURL = FIREBASE_CONFIG.databaseURL.trim().replace(/\/+$/, "");
+  }
   const configured = FIREBASE_CONFIG.databaseURL && !/YOUR-PROJECT-ID/.test(FIREBASE_CONFIG.databaseURL);
   let started = false;   // data connection must only ever open once
 
