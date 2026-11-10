@@ -83,18 +83,21 @@ any other conversation pauses it immediately.
 
 ## 3. Install the userscript
 
-1. Install the **Tampermonkey** extension in Chrome (or Violentmonkey).
-2. Tampermonkey icon → **Create a new script**, delete the boilerplate, paste
-   [`relay.user.js`](./relay.user.js).
-3. Edit the two lines at the top:
+> ✅ **Nothing to edit.** The script already contains the correct Firebase URL
+> (`soad-live`, asia-southeast1) and your thread ID (`18063962657394896`), and it
+> updates itself from this repo.
 
-   ```js
-   FIREBASE_DB_URL: 'https://your-project-default-rtdb.firebaseio.com/messages',
-   TARGET_CHAT_ID: '340282366841710300949128137453831912254',
-   ```
+**One-tap install (desktop or Android):**
 
-4. **Ctrl/Cmd + S** to save. Open the Instagram thread — a small pill appears in the
-   bottom-right corner:
+1. Install **Tampermonkey** (Firefox/Chrome → Add-ons → Tampermonkey).
+2. Open the raw script:
+   `https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js`
+3. Tampermonkey intercepts it and shows an **Install** button → tap it.
+
+**Or paste it manually:** Tampermonkey → **+** → select everything (Ctrl/Cmd+A) → paste
+[`relay.user.js`](./relay.user.js) → **Save**.
+
+Then open the Instagram thread — a small pill appears in the bottom-right corner:
 
    | Pill | Meaning |
    |---|---|

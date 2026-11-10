@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         IG Direct → Live Mirror Relay (read-only)
 // @namespace    https://github.com/orin/soad-live-chat
-// @version      1.1.0
+// @version      1.2.0
 // @description  Mirrors ONE Instagram Direct thread to Firebase Realtime Database for a public read-only page. Client-side DOM observation only — no login automation, no private APIs. Mobile (Firefox for Android) friendly.
 // @author       Orin
+// @downloadURL  https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js
+// @updateURL    https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js
 // @match        https://www.instagram.com/direct/*
 // @match        https://instagram.com/direct/*
 // @match        https://m.instagram.com/direct/*
@@ -47,7 +49,10 @@
   'use strict';
 
   /* ===================================================================================
-   * 1. CONFIGURATION  — EDIT THESE TWO LINES ONLY
+   * 1. CONFIGURATION  — ✅ ALREADY FILLED IN FOR ORIN
+   *    Firebase project : soad-live  (asia-southeast1)
+   *    Target thread    : 18063962657394896
+   *    You do not need to edit anything in this file.
    * =================================================================================== */
 
   const CONFIG = {
@@ -55,10 +60,10 @@
     // ⚠️ Copy it EXACTLY from the Firebase console (region names differ!).
     //    Asia / EU projects look like: https://<id>-default-rtdb.asia-southeast1.firebasedatabase.app
     //    US projects look like:        https://<id>-default-rtdb.firebaseio.com
-    FIREBASE_DB_URL: 'https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com/messages',
+    FIREBASE_DB_URL: 'https://soad-live-default-rtdb.asia-southeast1.firebasedatabase.app/messages',
 
     // The numeric thread id from https://www.instagram.com/direct/t/<THIS_NUMBER>/
-    TARGET_CHAT_ID: 'YOUR_THREAD_ID',
+    TARGET_CHAT_ID: '18063962657394896',
 
     // Polling / observation interval (ms). The MutationObserver also fires on DOM changes.
     SCAN_INTERVAL_MS: 1500,
@@ -92,7 +97,7 @@
    * 2. INTERNALS
    * =================================================================================== */
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const DB = String(CONFIG.FIREBASE_DB_URL).replace(/\/+$/, '');
   const LOG = (...a) => console.log('%c[relay]', 'color:#A800FF;font-weight:700', ...a);
   const WARN = (...a) => console.warn('%c[relay]', 'color:#ff9f0a;font-weight:700', ...a);
