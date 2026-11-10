@@ -4,6 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#000000" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <!-- Prevents Meta CDN 403s on reel thumbnails -->
 <meta name="referrer" content="no-referrer" />
 <title>Orin &amp; MD.Soad · Live</title>
@@ -67,14 +70,14 @@
     display:flex;
     align-items:center;
     gap:10px;
-    padding:11px 12px;
+    padding:calc(11px + env(safe-area-inset-top)) 12px 11px;
     background:rgba(0,0,0,.92);
     backdrop-filter:blur(14px);
     border-bottom:1px solid var(--line);
     z-index:5;
   }
   .icon-btn{
-    width:34px;height:34px;flex:0 0 auto;
+    width:38px;height:38px;flex:0 0 auto;   /* 38px ≈ comfortable tap target */
     display:grid;place-items:center;
     background:transparent;border:0;border-radius:50%;
     color:var(--text);cursor:pointer;padding:0;
@@ -102,7 +105,8 @@
   .uname{font-size:14.5px;font-weight:700;letter-spacing:-.15px;white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis}
   .verified{width:13px;height:13px;fill:#4d9dff;flex:0 0 auto}
-  .sub{font-size:11px;color:var(--muted);margin-top:2px;display:flex;align-items:center;gap:5px}
+  .sub{font-size:11px;color:var(--muted);margin-top:2px;display:flex;align-items:center;gap:5px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
   .live{
     display:inline-flex;align-items:center;gap:4px;
@@ -160,6 +164,7 @@
 
   .bubble{
     position:relative;
+    -webkit-user-select:text;user-select:text;
     padding:9px 13px;
     border-radius:19px;
     font-size:14.5px;line-height:1.42;
@@ -250,7 +255,7 @@
     font-size:14px;font-family:inherit;cursor:not-allowed;
   }
   .inputbar input::placeholder{color:#7d7d7d}
-  .inputbar .icon-btn{width:30px;height:30px}
+  .inputbar .icon-btn{width:34px;height:34px}
   .inputbar .icon-btn svg{width:20px;height:20px}
   .send{
     width:30px;height:30px;border-radius:50%;display:grid;place-items:center;
@@ -259,12 +264,13 @@
   .send svg{width:16px;height:16px;fill:currentColor}
   .foot-note{
     text-align:center;font-size:10px;color:#6d6d6d;margin-top:7px;letter-spacing:.25px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   }
   .foot-note b{color:#8f8f8f;font-weight:600}
 
   /* ── lightbox ────────────────────────────────────────────────────────── */
   .lb{
-    position:absolute;inset:0;z-index:40;display:none;
+    position:fixed;inset:0;z-index:60;display:none;
     background:rgba(0,0,0,.94);backdrop-filter:blur(6px);
     align-items:center;justify-content:center;padding:18px;
   }
@@ -296,6 +302,10 @@
   /* ══ LOGIN GATE ══════════════════════════════════════════════════════ */
   .gate{
     position:fixed;inset:0;z-index:100;
+    /* dvh keeps the card centred when the phone keyboard opens */
+    padding:env(safe-area-inset-top) env(safe-area-inset-right)
+            env(safe-area-inset-bottom) env(safe-area-inset-left);
+    overflow-y:auto;-webkit-overflow-scrolling:touch;
     display:grid;place-items:center;
     background:
       radial-gradient(760px 520px at 50% 8%, #2a0f45 0%, #0a0610 55%, #000 100%);
@@ -307,7 +317,8 @@
   @keyframes gateOut{to{opacity:0;transform:scale(.985)}}
 
   .gate-card{
-    width:100%;max-width:344px;
+    width:100%;max-width:344px;margin:auto;
+    max-height:calc(100dvh - 24px);overflow-y:auto;
     background:rgba(18,18,18,.9);
     border:1px solid #2f2f2f;
     border-radius:20px;
@@ -329,8 +340,8 @@
   .field input{
     width:100%;box-sizing:border-box;
     background:#0e0e0e;border:1px solid #333;border-radius:12px;
-    padding:13px 40px 13px 13px;
-    font-size:14.5px;color:#f2f2f2;font-family:inherit;
+    padding:14px 42px 14px 14px;
+    font-size:16px;color:#f2f2f2;font-family:inherit;
     outline:none;transition:border-color .18s, background .18s;
   }
   .field input::placeholder{color:#767676}
@@ -346,7 +357,7 @@
     stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 
   .gate-btn{
-    width:100%;margin-top:6px;
+    width:100%;margin-top:6px;min-height:48px;   /* comfortable touch target */
     background:var(--grad);color:#fff;border:0;border-radius:12px;
     padding:13px;font-size:14.5px;font-weight:700;font-family:inherit;
     cursor:pointer;letter-spacing:.2px;
@@ -378,6 +389,23 @@
     animation:spin .7s linear infinite;
   }
   @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ── narrow-phone header budget (360px Android is tight) ──────────────── */
+  @media (max-width:420px){
+    header{gap:8px;padding-left:8px;padding-right:8px}
+    .uname{font-size:13.5px}
+    .head-actions{gap:0}
+    .head-actions .icon-btn{width:32px;height:32px}
+    .head-actions .icon-btn svg{width:19px;height:19px}
+    .logout{padding:3px 7px;font-size:9px}
+    .foot-note{font-size:9px}
+  }
+  @media (max-width:360px){
+    /* drop the video-call mock first — it is decorative */
+    .head-actions .icon-btn[aria-label="Video call"]{display:none}
+    .who-text{min-width:0}
+    .uname{max-width:96px}
+  }
 
   /* sign-out chip, shown in the header once unlocked */
   .logout{

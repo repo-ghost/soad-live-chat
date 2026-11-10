@@ -281,7 +281,70 @@ The userscript keeps working either way, because its writes stay permitted by `.
 
 ---
 
-## 8. Troubleshooting
+## 8. Running it from an Android phone (Firefox + Tampermonkey)
+
+This setup is fully supported — the relay is designed to survive Android's aggressive
+backgrounding.
+
+### Setup checklist
+
+| Step | What to do |
+|---|---|
+| 1 | Firefox for Android → menu → **Add-ons** → install **Tampermonkey** |
+| 2 | Tampermonkey → **+** → paste `relay.user.js` → set `FIREBASE_DB_URL` and `TARGET_CHAT_ID` → **Save** |
+| 3 | Tampermonkey → your script → **Settings** → confirm the `@connect` lines are intact (they let it talk to Firebase) |
+| 4 | Instagram in Firefox → menu → **Request desktop site** → open the MD.Soad thread |
+| 5 | Tap the pill in the bottom-right corner to open the **diagnostics panel** |
+
+### Keep the tab alive
+
+Android suspends background tabs, so the relay will pause when you switch apps — that is
+intentional and lossless:
+
+- Scans stop while the tab is hidden (`PAUSE_WHEN_HIDDEN`).
+- The moment you return, it scans immediately and **catches up** from Firebase. Messages
+  sent while you were away are relayed then, in order.
+
+Two things you *should* change on the phone:
+
+1. **Firefox → Settings → Data collection → turn OFF "Block trackers"** for `instagram.com`.
+   Enhanced tracking protection can kill the extension's Firebase requests.
+2. **Firefox → Settings → Advanced → keep the Instagram tab available** (or use
+   *Add to Home screen* on the thread). Avoid "Close tabs on exit".
+
+> ⚠️ **Do not lock the phone with Chrome/Firefox in the background expecting live sync.**
+> Nothing on Android runs reliably when the screen is off. The mirror updates whenever the
+> tab is open and awake, then catches up when you come back. That is the honest limit of a
+> phone-only setup — a cheap always-on PC is the only way to get true 24/7.
+
+### Verifying it really syncs (from the phone)
+
+1. Open the thread, **Request desktop site**, wait for the pill to read
+   `🔴 Live · N relayed`.
+2. **Tap the pill** — the panel must show:
+   - `match : YES`
+   - `transport : GM_xmlhttpRequest ✓`
+   - `last HTTP : 200`
+   - `rows found` greater than 0
+3. Ask MD.Soad to send a message. Within ~2s `relayed` should increase.
+4. Open your Pages URL in another tab → sign in → the message is there.
+5. Confirm in the Firebase console: **Realtime Database → Data** shows a `messages` node
+   with children.
+
+### If the pill shows an error, the panel tells you exactly what to fix
+
+| Panel says | Fix |
+|---|---|
+| `last HTTP : 401/403` | rules block reads → set `.read: true` and Publish |
+| `last HTTP : 404` | wrong database URL (region!) — copy it from the console header |
+| `No connection to Firebase` | tracker blocking, or the `@connect` lines are missing |
+| `transport : fetch (GM failed — blocked?)` | Tampermonkey's `GM_xmlhttpRequest` was blocked; re-install the script so `@grant` applies |
+| `FIREBASE_DB_URL still has the placeholder` | you have not pasted your real project URL |
+| `rows found : 0` | desktop-site mode is off, or the thread has not finished loading — scroll up and down once |
+
+---
+
+## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
