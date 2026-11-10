@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IG Direct → Live Mirror Relay (read-only)
 // @namespace    https://github.com/orin/soad-live-chat
-// @version      1.2.0
+// @version      1.3.0
 // @description  Mirrors ONE Instagram Direct thread to Firebase Realtime Database for a public read-only page. Client-side DOM observation only — no login automation, no private APIs. Mobile (Firefox for Android) friendly.
 // @author       Orin
 // @downloadURL  https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js
@@ -97,7 +97,7 @@
    * 2. INTERNALS
    * =================================================================================== */
 
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
   const DB = String(CONFIG.FIREBASE_DB_URL).replace(/\/+$/, '');
   const LOG = (...a) => console.log('%c[relay]', 'color:#A800FF;font-weight:700', ...a);
   const WARN = (...a) => console.warn('%c[relay]', 'color:#ff9f0a;font-weight:700', ...a);
@@ -264,7 +264,10 @@
   }
 
   function safeRowCount() {
-    try { return getRows().length; } catch (_) { return -1; }
+    try {
+      const r = getRows();
+      return (r.length ? r : getRowsByStructure()).length;
+    } catch (_) { return -1; }
   }
 
   /** Turns a raw failure into an actionable explanation. */
@@ -517,61 +520,136 @@
     return m ? m[1] : null;
   }
 
-  function pickThreadRoot() {
-    let best = null;
-    let bestCount = 0;
-    document.querySelectorAll('div[role="grid"]').forEach((g) => {
-      if (g.closest('[role="dialog"]')) return;
-      const n = g.querySelectorAll('div[role="row"]').length;
-      if (n > bestCount) { bestCount = n; best = g; }
-    });
-    if (best) return best;
-    // Desktop-site mode on some builds uses a listbox instead of a grid
-    document.querySelectorAll('[role="listbox"]').forEach((g) => {
-      if (g.closest('[role="dialog"]')) return;
-      const n = g.querySelectorAll('[role="row"],[role="listitem"]').length;
-      if (n > bestCount) { bestCount = n; best = g; }
-    });
-    if (best) return best;
-    const main = document.querySelector('main') || document.body;
-    return main;
-  }
-
+  /** Does a row look like a message (not an inbox entry or a date divider)? */
   function looksLikeMessageRow(row) {
     if (row.closest('[role="dialog"]')) return false;
     const rect = row.getBoundingClientRect();
-    if (rect.width < 60 || rect.height < 4) return false;
+    if (rect.width < 60 || rect.height < 6) return false;
     if (row.querySelector('[dir="auto"]')) return true;
     if (row.querySelector('audio, video')) return true;
     if (row.querySelector('img')) return true;
     return !!row.querySelector('a[href*="/reel/"], a[href*="/p/"], a[href*="/tv/"]');
   }
 
+  /**
+   * Is this row part of the conversation list (left rail / inbox)?
+   * Inbox rows CONTAIN a link to another thread; the open conversation never does.
+   */
+  function inInbox(el) {
+    if (!el || !el.closest) return false;
+    if (el.querySelector('a[href*="/direct/t/"]')) return true;      // link is a child
+    // NOTE: do not exclude [role="listbox"] outright — some conversation layouts
+    // use a listbox for the message list itself. Only nav/sidebar containers.
+    if (el.closest('nav, [aria-label*="Conversation" i], [aria-label*="Chats" i], [aria-label*="Inbox" i]')) return true;
+    // a row sitting in a narrow left rail is the inbox list
+    const r = el.getBoundingClientRect();
+    if (r.width && r.right < window.innerWidth * 0.45 && document.querySelectorAll('a[href*="/direct/t/"]').length) {
+      return true;
+    }
+    return false;
+  }
+
+  /** Instagram renders each message twice (a visible bubble + a hidden measure node). */
+  function isHiddenRow(row) {
+    if (row.getAttribute('aria-hidden') === 'true') return true;
+    let el = row;
+    for (let i = 0; i < 4 && el && el !== document.body; i++, el = el.parentElement) {
+      const st = getComputedStyle(el);
+      if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') return true;
+      const r = el.getBoundingClientRect();
+      if (r.height < 6 || r.width < 6) return true;
+    }
+    return false;
+  }
+
+  /** The element that actually scrolls the conversation. */
+  function pickThreadScroller(rows) {
+    if (!rows.length) return null;
+    let el = rows[0].parentElement;
+    while (el && el !== document.body) {
+      try {
+        const st = getComputedStyle(el);
+        if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 20) return el;
+      } catch (_) { /* ignore */ }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * Finds the message rows of the OPEN conversation only.
+   *
+   * Strategy: take every rendered row, drop the ones belonging to the inbox
+   * (they link to other threads) and the hidden duplicate measure nodes, then
+   * split the survivors into contiguous groups by shared scroll ancestor and
+   * keep the group that contains the newest message (greatest DOM y).
+   */
   function getRows() {
-    const root = pickThreadRoot();
-    if (!root) return [];
+    const all = Array.from(document.querySelectorAll('div[role="row"], [role="listitem"]'));
 
-    let rows = Array.from(root.querySelectorAll('div[role="row"]')).filter(looksLikeMessageRow);
-    if (!rows.length) {
-      rows = Array.from(root.querySelectorAll('[role="listitem"]')).filter(looksLikeMessageRow);
+    const cands = [];
+    for (const el of all) {
+      if (el.closest('[role="dialog"]')) continue;
+      if (inInbox(el)) continue;
+      if (isHiddenRow(el)) continue;
+      if (!looksLikeMessageRow(el)) continue;
+      const r = el.getBoundingClientRect();
+      cands.push({ el, y: r.top, scroller: el.parentElement ? pickThreadScroller([el]) : null });
+    }
+    if (!cands.length) return [];
+
+    // group by scroll container so the inbox (inside the page scroll) cannot mix in
+    const groups = new Map();
+    for (const c of cands) {
+      const key = c.scroller || document.body;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(c);
     }
 
-    // ── structural fallback ──────────────────────────────────────────────────────
-    // If Instagram's wrappers change (or desktop-mode differs), group the message
-    // text nodes by their nearest meaningful ancestor and treat those as rows.
-    if (!rows.length) {
-      const texts = Array.from(root.querySelectorAll('[dir="auto"]')).filter(
-        (n) => (n.innerText || '').trim() && !n.closest('[role="dialog"]')
-      );
-      const seen = new Set();
-      texts.forEach((n) => {
-        const group = n.parentElement?.parentElement || n.parentElement;
-        if (!group || seen.has(group)) return;
-        seen.add(group);
-        if (looksLikeMessageRow(group)) rows.push(group);
-      });
+    // The open conversation lives in a dedicated scroll container; the inbox has
+    // its own. Prefer a group that has one, then the one with the most rows.
+    const scored = [];
+    for (const [key, list] of groups) {
+      const hasScroller = key && key !== document.body ? 1 : 0;
+      const lastY = Math.max(...list.map((c) => c.y));
+      scored.push({ list, hasScroller, size: list.length, lastY });
     }
-    return rows;
+    scored.sort((a, b) =>
+      b.hasScroller - a.hasScroller ||   // real conversation scroller first
+      b.size - a.size ||                 // then the longest run
+      b.lastY - a.lastY                  // then the lowest on screen
+    );
+    const best = scored[0].list;
+
+    best.sort((a, b) => a.y - b.y);
+    return best.map((c) => c.el);
+  }
+
+  /**
+   * Last-resort row discovery for markup we do not recognise (e.g. a future
+   * "desktop site" layout): group [dir="auto"] message nodes by their nearest
+   * message-sized ancestor, skipping the inbox and hidden measure nodes.
+   */
+  function getRowsByStructure() {
+    const nodes = Array.from(document.querySelectorAll('[dir="auto"]')).filter(
+      (n) => (n.innerText || '').trim() && !n.closest('[role="dialog"]') && !inInbox(n)
+    );
+    const groups = [];
+    const seen = new Set();
+    for (const n of nodes) {
+      let g = n.parentElement;
+      for (let i = 0; i < 3 && g && g.parentElement; i++) {
+        if (g.querySelectorAll('[dir="auto"]').length === 1) break;
+        g = g.parentElement;
+      }
+      if (!g || seen.has(g)) continue;
+      seen.add(g);
+      const r = g.getBoundingClientRect();
+      if (r.height < 6 || r.width < 40) continue;
+      if (inInbox(g) || isHiddenRow(g)) continue;
+      groups.push(g);
+    }
+    return groups;
   }
 
   const isLikelyAvatar = (img) => {
@@ -644,9 +722,18 @@
       if (t) parts.push(t);
     }
     const out = [];
-    parts.forEach((p) => { if (out[out.length - 1] !== p) out.push(p); });
+    parts.forEach((p) => {
+      if (NOISE_ALT.test(p)) return;                       // alt text, not a message
+      if (/^\d+[smhd]$/.test(p)) return;                   // "55m" timestamp
+      if (/^\d{1,2}:\d{2}(\s?[AP]M)?$/i.test(p)) return;    // "8:04 PM"
+      if (out[out.length - 1] !== p) out.push(p);
+    });
     return out.join('\n').trim();
   }
+
+  // Instagram labels photos with alt="Shared photo" / "Photo shared by …" — that is
+  // not user text, so it must never become a caption.
+  const NOISE_ALT = /^(shared photo|photo shared by|video shared by|image|photo|gif|sticker)/i;
 
   const IG_CONTENT_RE = /instagram\.com\/(reel|reels|p|tv)\//i;
 
@@ -675,6 +762,17 @@
     } catch (_) {
       return hash(String(src)).slice(0, 8);
     }
+  }
+
+  /** Rows that are pure chrome (timestamps, "Sent an attachment") are not messages. */
+  function isJunkItem(item) {
+    if (item.kind !== 'text') return false;
+    const t = (item.text || '').trim();
+    if (!t) return true;
+    if (/^\d{1,2}:\d{2}(\s?[AP]M)?$/i.test(t)) return true;      // clock only
+    if (/^(today|yesterday|mon|tue|wed|thu|fri|sat|sun)/i.test(t) && t.length < 12) return true;
+    if (/sent an attachment\.?$/i.test(t) && t.length < 40) return true;
+    return false;
   }
 
   function extractRow(row) {
@@ -865,7 +963,8 @@
       return;
     }
 
-    const rows = getRows();
+    let rows = getRows();
+    if (!rows.length) rows = getRowsByStructure();   // unknown markup fallback
     STATE.lastRows = rows.length;
     if (!rows.length) {
       hud('⏳ Waiting for messages to render…', 'warn');
@@ -876,7 +975,13 @@
     STATE.paused = false;
     STATE.lastScanAt = nowMs();
     try {
-      const items = rows.map(extractRow);
+      // extract, then drop rows that are pure Instagram chrome (timestamps,
+      // "sent an attachment", date dividers) before anything is compared or sent
+      const items = rows.map(extractRow).filter((i) => !isJunkItem(i));
+      if (!items.length) {
+        hud('⏳ Waiting for messages to render…', 'warn');
+        return;
+      }
       const domSigs = items.map((i) => i.sig);
 
       const looseSlice = () => {
