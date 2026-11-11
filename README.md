@@ -358,11 +358,11 @@ Two things you *should* change on the phone:
 | Reel thumbnails 403 | keep `<meta name="referrer" content="no-referrer">` in `<head>` (already set) |
 | Duplicate-looking history | the relay only pushes rows it has not seen; a fresh bootstrap on an empty DB is expected to push everything once |
 | Relay stops after switching chats | by design — reopen the target thread and it resumes automatically |
-| **"Reading history…" never finishes** | fixed in v2.4.0 — update, then press **⬆** again. If it still stalls, the pill now says *"History read stalled · DB left untouched"* within 45 s instead of hanging |
+| **Messages out of order** | rows written by v3 carry `seq` and the site sorts on it. Rows from older versions have no `seq` and stay where they were — delete the node once for a clean rebuild |
 | **Pill stuck on "Waiting for messages to render…"** | v2.2.0 names the reason in the pill itself. Tap the pill and read the *"what the page looks like"* block — it lists composer, transcript, text nodes, listboxes and scroll boxes. Then press **⬆** |
-| **Nothing saves / DB empty** | press **⬆**. If it still fails, long-press **⬆** and send the report — it says whether the composer and transcript were found at all |
+| **Nothing saves / DB empty** | make sure the button says 🔴 **⏸ PAUSE** (i.e. it is running). If the button is greyed out, you are not on the target thread |
 | **Profile pictures saved as message photos** | fixed in v2.3.0 — update the userscript, then press **⬆** once to rebuild the node cleanly |
-| **Rows duplicated** | press **⬆** — it clears the node first. (Fixed in v2.2.0; older versions could double-write) |
+| **Rows duplicated** | delete the `messages` node once, then re-save with ▶. v3 cannot double-write: it skips anything already in the database |
 | **New profile photo does not appear** | GitHub Pages cached the old bytes — bump `ICON_VERSION` in `index.html` (see [§4](#profile-pictures)), then hard-refresh with Ctrl/Cmd+Shift+R |
 | **Forgot the login** | regenerate with `node tools/make-login.js <user> <pass>` and commit (see [§7](#7-login-gate)) |
 | **Gate won't accept the right password** | passwords are case-sensitive and it must be the *digest* you pasted — re-run `node tools/make-login.js` to be sure |
@@ -385,48 +385,52 @@ Fixed in v2.3.0 by judging what is *on screen* plus explicit markers:
 An avatar also no longer counts as "this row has content", so a text message can never be
 promoted to a photo again.
 
-### Why "Reading history…" used to hang (and no longer does)
+### How you use it now (v3) — one button, you scroll, it saves
 
-The reading phase did the work **twice**: one full upward walk to load every message,
-then a second top→bottom walk to rebuild the order. On a long thread that is double the
-scrolling and double the waiting — and because the time limit was only checked at the top
-of the outer loop, a slow thread could blow past it by minutes.
+There is a single button in the **top-right corner** of instagram.com:
 
-v2.4.0:
+| Button | Meaning |
+|---|---|
+| 🟢 **▶ START** | saving is off. Nothing is read, nothing is written |
+| 🔴 **⏸ PAUSE** | saving is on |
 
-- **one pass.** Upward steps are collected by prepending, so the list is already in chat
-  order; the second walk is gone.
-- **90 s ceiling** on the whole read (was up to 4 minutes).
-- **stall guard** — if the scroll position stops moving, it gives up instead of spinning.
-- **watchdog** — no progress for 45 s aborts the read and leaves the database untouched.
-- **faster nudging** — stops as soon as the loader answers instead of always doing three
-  rounds.
-- duplicate sightings collapse by signature, keeping genuinely-repeated messages.
+It always starts **paused**. This is deliberate: the relay only ever does what you
+ask, which is what keeps it ban-safe.
 
-Measured on a 150-message thread: **30 s end to end**, and the pill never sat unchanged
-for more than 6 s.
+**First run**
 
-### The ⬆ button — jump to the first message
+1. Open the MD.Soad chat and press **▶**. A ✅ appears beside each message it saves.
+2. Scroll **up** toward the first message. As new history renders, it keeps saving.
+   The ✅ marks follow your screen so you can see the progress.
+3. When you reach the top and everything has a ✅, you are done. Press **⏸**.
 
-The purple **⬆** button sits above the status pill on instagram.com. Press it whenever
-the DB is empty, half-filled, or you just want the chat rebuilt from message #1:
+**Later runs**
 
-1. it scrolls the conversation all the way up, nudging Instagram's lazy loader
-   (scroll + wheel + touch events) until the transcript stops growing;
-2. it reads the **whole** history;
-3. only then does it clear the `messages` node, and only if at least 2 messages came
-   back — collect, verify, wipe, write. A failed read can never destroy good data;
-4. it re-writes the entire history oldest → newest, with the usual 80 ms spacing.
+Open the chat and press **▶**. Anything already in the database is skipped *before*
+any media is downloaded, so it only saves what is genuinely new — typically the last
+few messages. What it saves goes into the right place in the chat, because every row
+carries its true position (`seq`).
 
-**Long-press** the button (600 ms) to copy a *page report* into a text box on screen:
-composer state, transcript size, detected bubbles, and the scroll containers it can
-choose from. That report is what makes a real Instagram bug diagnosable from a phone —
-send it whenever something misbehaves.
+**If something cannot be saved**
 
-While it runs, normal scanning is suspended: two writers racing on the same thread
-was producing duplicated rows (104 rows for 36 messages). Only one history read can
-be in flight at a time, so pressing the button during the boot-time read queues
-behind it instead of fighting it.
+A photo, reel, audio or file that fails three times is not saved as a blank bubble.
+It is recorded as `⚠️ Can't load this photo!` (or reel / audio / file / message) so the
+site tells the truth instead of showing an empty gap. Binary-backoff between attempts,
+so this never turns into a request storm.
+
+### Why the old automatic scrolling is gone
+
+Earlier versions tried to scroll the chat for you. On real Instagram that never
+worked reliably: the transcript lazy-loads, virtualises and sometimes refuses to move
+at all, and a failed scroll looked identical to "nothing here". v3 removes that whole
+class of failure by leaving scrolling to your finger — the one thing that always works.
+
+### Why reply banners are no longer saved
+
+Instagram renders `M∂.รσα∂ replied to you` inside the same block as the message. The old
+filter tried to list which characters a name could contain, which broke on that name.
+It now matches the banner's **shape** (`… replied to …`) with no character assumptions,
+and a block whose only text is a banner is skipped entirely.
 
 ### Why v2.1.0 suddenly "sees" messages again
 
@@ -444,10 +448,10 @@ structure instead:
 If a future Instagram update breaks it again, `__relayDebug.snapshot()` in the console prints
 exactly what the script sees.
 
-### How catch-up avoids duplicates
+### How duplicates are impossible now
 
-The relay keeps a short tail of `{key, sig}` pairs from Firebase, then finds the longest
-suffix of that tail that appears **contiguously and in rank order** in the DOM. Everything
-after the match is new. If the newest stored message is not on screen at all (virtualised
-list, or you scrolled up), it waits rather than guessing — and after a few scans it switches
-to sticky signature-based de-dupe so it can never stall forever.
+Before writing a single byte, the relay compares every message on screen against the
+signature index of the whole database, then against what it has already pushed this
+session. A message is written only if its slot is genuinely empty. There is no
+alignment heuristic left to get wrong.
+

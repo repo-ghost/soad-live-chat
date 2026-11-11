@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IG Direct → Live Mirror Relay (read-only)
 // @namespace    https://github.com/orin/soad-live-chat
-// @version      2.4.0
+// @version      3.0.0
 // @description  Mirrors ONE Instagram Direct thread to Firebase Realtime Database for a public read-only page. Client-side DOM observation only — no login automation, no private APIs. Mobile (Firefox for Android) friendly.
 // @author       Orin
 // @downloadURL  https://raw.githubusercontent.com/repo-ghost/soad-live-chat/arena/9c327de7-soad-live-chat/relay.user.js
@@ -26,23 +26,29 @@
 // ==/UserScript==
 
 /* =====================================================================================
- *  HOW IT WORKS (and why it is ban-safe)
+ *  HOW IT WORKS  (v3 — manual, start/pause driven)
  *  ---------------------------------------------------------------------------------
- *  This script NEVER logs in, never stores cookies, never calls a private API.
- *  It is a passive observer: it reads the DOM that Instagram already rendered in a
- *  browser tab *you* are logged into, and relays what it sees to Firebase.
+ *  The script does NOT scroll the chat for you. You scroll; it saves.
  *
- *  Only the thread whose ID matches TARGET_CHAT_ID is relayed. Open any other chat and
- *  the relay pauses instantly (no reads, no writes).
+ *    1. Scroll the conversation up to the very first message yourself.
+ *    2. Press ▶ START (top-right). From then on it saves every message reachable
+ *       from where you are downward, and keeps saving as new ones appear.
+ *    3. Every message it saves gets a ✅ drawn next to it, so you can see the
+ *       progress with your own eyes.
+ *    4. Press ⏸ PAUSE any time. Nothing is read and nothing is written.
+ *    5. Next session: press ▶ START and it saves only what is genuinely missing
+ *       (anything already in the database is skipped before any media fetch).
  *
- *  MOBILE NOTES (Firefox for Android + Tampermonkey)
+ *  WHY THIS IS BAN-SAFE
  *  ---------------------------------------------------------------------------------
- *  • Firebase calls prefer GM_xmlhttpRequest, which bypasses Instagram's CSP/CORS
- *    entirely. If the extension blocks it we fall back to fetch() automatically.
- *  • Android freezes background tabs. Scans pause while the tab is hidden and run
- *    immediately when you return, then catch up from Firebase — no lost messages.
- *  • Works in "Desktop site" mode. Rows are found by several strategies, and if the
- *    markup differs the HUD's diagnostic panel tells you what was actually seen.
+ *  It never logs in, never stores cookies, never calls a private API, never sends a
+ *  message, never reacts, and never touches anything outside the one thread you open.
+ *  It reads the DOM that Instagram already rendered in a tab *you* are logged into,
+ *  and it writes only to your own Firebase. All activity is driven by your finger on
+ *  a button — there is no autonomous loop hammering the page.
+ *
+ *  Every message is saved at most once. Media is fetched only for messages that are
+ *  not yet in the database, so re-running this never re-downloads old photos.
  * ===================================================================================== */
 
 (function () {
@@ -50,54 +56,41 @@
 
   /* ===================================================================================
    * 1. CONFIGURATION  — ✅ ALREADY FILLED IN FOR ORIN
-   *    Firebase project : soad-live  (asia-southeast1)
-   *    Target thread    : 18063962657394896
-   *    You do not need to edit anything in this file.
    * =================================================================================== */
 
   const CONFIG = {
     // Firebase Realtime Database REST base for the *messages* node.
-    // ⚠️ Copy it EXACTLY from the Firebase console (region names differ!).
-    //    Asia / EU projects look like: https://<id>-default-rtdb.asia-southeast1.firebasedatabase.app
-    //    US projects look like:        https://<id>-default-rtdb.firebaseio.com
     FIREBASE_DB_URL: 'https://soad-live-default-rtdb.asia-southeast1.firebasedatabase.app/messages',
 
     // The numeric thread id from https://www.instagram.com/direct/t/<THIS_NUMBER>/
     TARGET_CHAT_ID: '18063962657394896',
 
-    // Polling / observation interval (ms). The MutationObserver also fires on DOM changes.
-    SCAN_INTERVAL_MS: 1500,
+    // While ▶ is pressed, how often we look at the screen (ms).
+    SCAN_INTERVAL_MS: 1600,
 
-    // Delay between sequential writes so message order is preserved (ms).
+    // Gap between sequential writes so message order is preserved (ms).
     POST_DELAY_MS: 80,
 
     // Media encoding.
     MAX_IMAGE_PX: 800,
     JPEG_QUALITY: 0.70,
-    MAX_AUDIO_BYTES: 1400000, // ~1.4 MB raw ≈ 1.9 MB base64; skip bigger clips.
+    MAX_AUDIO_BYTES: 1400000, // ~1.4 MB raw ≈ 1.9 MB base64; bigger clips keep only the URL.
 
     // How many recent Firebase rows to compare against when catching up.
-    HISTORY_LOOKBACK: 300,
+    HISTORY_LOOKBACK: 600,
 
-    // If the DOM keeps lagging the database for this many scans, switch to "loose"
-    // dedupe (push only messages whose signature is absent from recent history).
-    BEHIND_RECOVERY_SCANS: 8,
+    // Retries for a single message that fails to save (media fetch, network…).
+    MAX_ATTEMPTS: 3,
 
-    // Android: skip scans while the tab is in the background, then catch up on return.
+    // Skip scans while the tab is in the background; catch up on return.
     PAUSE_WHEN_HIDDEN: true,
 
-    // ── Full-history backfill ────────────────────────────────────────────────
-    // On an empty database the relay scrolls the conversation to the very first
-    // message, collecting as it goes, then walks back down. Set to false if you
-    // only ever want what is currently on screen.
-    BACKFILL: true,
-    SCROLL_STEP_RATIO: 0.85,     // how much of the viewport to scroll per step
-    SCROLL_SETTLE_MS: 420,       // wait for lazy-loaded rows after each step
-    SCROLL_TOP_GRACE: 5,         // extra passes at the top before believing we arrived
-    MAX_BACKFILL_MS: 90000,      // hard stop (90 s) for the whole history read
+    // Start in the paused state. You press ▶ when you are ready.
+    START_RUNNING: false,
 
-    // Small status pill in the corner (tap it to open diagnostics).
+    // Show the tiny status pill + the ✅ markers.
     SHOW_HUD: true,
+    SHOW_SAVED_MARKS: true,
 
     // Extra logging in the browser console.
     VERBOSE: false,
@@ -107,40 +100,44 @@
    * 2. INTERNALS
    * =================================================================================== */
 
-  const VERSION = '2.4.0';
+  const VERSION = '3.0.0';
   const DB = String(CONFIG.FIREBASE_DB_URL).replace(/\/+$/, '');
   const LOG = (...a) => console.log('%c[relay]', 'color:#A800FF;font-weight:700', ...a);
   const WARN = (...a) => console.warn('%c[relay]', 'color:#ff9f0a;font-weight:700', ...a);
   const VLOG = (...a) => { if (CONFIG.VERBOSE) LOG(...a); };
 
   const STATE = {
-    ready: false,          // initial Firebase snapshot loaded
-    paused: true,          // URL does not match target thread
+    ready: false,            // Firebase tail has been loaded
+    running: false,          // ▶ pressed (vs ⏸ paused)
     scanning: false,
-    wrote: 0,
-    tail: [],              // [{ key, sig }] ascending — what Firebase already knows
-    reactions: new Map(),  // key -> reaction string | null
-    mediaCache: new Map(), // src -> data URL
+    writeLock: false,        // a save batch is in flight
+    wrote: 0,                // messages saved this session
+    tail: [],                // [{ key, sig }] ascending — what Firebase already knows
+    sigCounts: new Map(),    // sig -> how many times it exists in the database
+    seenThisSession: new Map(), // sig -> count pushed this session (before reload)
+    reactions: new Map(),    // key -> reaction string | null
+    mediaCache: new Map(),   // src -> data URL
     lastHudText: '',
-    behindScans: 0,        // consecutive scans where the DOM lags the database
-    looseDedupe: false,    // sticky fallback: dedupe by signature instead of alignment
-    backfilled: false,     // one-time full-history read has run
-    resetPushed: false,    // manual "start at the first message" was completed
-    holdScansUntil: 0,     // scan() stands down until this moment
-    inManualBackfill: false,
     // diagnostics
-    transport: 'unknown',  // 'gm' | 'fetch'
-    lastStatus: null,      // last HTTP status from Firebase
+    transport: 'unknown',
+    lastStatus: null,
     lastError: '',
     lastRows: 0,
     lastScanAt: 0,
+    pausedReason: 'starting',
+    posSeq: new Map(),     // sig -> chat position (0 = oldest) learned from scrolling
+    posMode: 'forward',    // positions are known → written as `seq`
+    maxSeq: -1,
+    minSeq: 0,
+    orderDecided: false,
+    frontLine: null,       // topmost sig saved by the LATEST pass (you are scrolling up)
+    frontLineKey: '',
     bootAt: Date.now(),
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const nowMs = () => Date.now();
 
-  // ── hashing (stable, tiny) ────────────────────────────────────────────────────────
   function hash(str) {
     let h = 0x811c9dc5;
     for (let i = 0; i < str.length; i++) {
@@ -151,249 +148,105 @@
   }
 
   /* ===================================================================================
-   * 3. HUD + DIAGNOSTICS PANEL
-   *     On a phone there is no console, so everything important lives on screen.
+   * 3. UI — one green/red button (top-right), a status pill, and ✅ marks
    * =================================================================================== */
 
+  let btnEl = null;
   let hudEl = null;
-  let panelEl = null;
+  let marksLayer = null;
+  const markFor = new Map();   // sig -> {count, els:[badge]}
+  let markRaf = 0;
+
+  function el(tag, style, text) {
+    const e = document.createElement(tag);
+    if (style) e.setAttribute('style', style);
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  /** The state of the page relative to what we can actually do right now. */
+  function currentState() {
+    const id = chatIdFromUrl();
+    if (!id) return { code: 'no-thread', label: 'No chat open', hint: 'Open the MD.Soad chat' };
+    if (id !== String(CONFIG.TARGET_CHAT_ID)) {
+      return { code: 'wrong-thread', label: 'Wrong chat', hint: 'This relay only mirrors the MD.Soad thread' };
+    }
+    if (!STATE.ready) return { code: 'connecting', label: 'Connecting…', hint: 'Loading the database index' };
+    if (!STATE.running) return { code: 'paused', label: 'Paused', hint: 'Press ▶ to start saving' };
+    return { code: 'running', label: 'Saving', hint: 'Saving what is on screen' };
+  }
+
+  function ensureStartButton() {
+    if (btnEl) return;
+    btnEl = el('div');
+    btnEl.id = 'ig-relay-toggle';
+    btnEl.addEventListener('pointerdown', (ev) => { ev.stopPropagation(); });
+    btnEl.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleRunning();
+    });
+    document.documentElement.appendChild(btnEl);
+    paintButton();
+  }
+
+  function paintButton() {
+    if (!btnEl) return;
+    const s = currentState();
+    const live = s.code === 'running';
+    const blocked = s.code === 'no-thread' || s.code === 'wrong-thread' || s.code === 'connecting';
+
+    // green ▶ when paused and ready, red ⏸ when saving, grey when we cannot act
+    const bg = blocked
+      ? 'linear-gradient(135deg,#3a3a3a,#2a2a2a)'
+      : live
+        ? 'linear-gradient(135deg,#ff3b30,#c1121f)'
+        : 'linear-gradient(135deg,#22c55e,#15803d)';
+
+    btnEl.setAttribute('style', [
+      'position:fixed', 'top:10px', 'right:10px', 'z-index:2147483600',
+      'display:flex', 'align-items:center', 'gap:6px',
+      'padding:9px 14px', 'border-radius:999px',
+      'background:' + bg, 'color:#fff',
+      'font:700 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+      'letter-spacing:.3px',
+      'border:1px solid rgba(255,255,255,.25)',
+      'box-shadow:0 4px 16px rgba(0,0,0,.5)',
+      'cursor:pointer', 'user-select:none', 'touch-action:manipulation',
+      'opacity:' + (blocked ? '0.75' : '1'),
+    ].join(';'));
+
+    const glyph = live ? '⏸' : '▶';
+    const text = blocked ? s.label : (live ? 'PAUSE' : 'START');
+    btnEl.textContent = glyph + ' ' + text;
+    btnEl.title = s.hint;
+  }
 
   function ensureHud() {
     if (!CONFIG.SHOW_HUD || hudEl) return;
-    hudEl = document.createElement('div');
+    hudEl = el('div');
     hudEl.id = 'ig-relay-hud';
-    hudEl.setAttribute(
-      'style',
-      [
-        'position:fixed', 'right:12px', 'bottom:12px', 'z-index:2147483000',
-        'font:600 11.5px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
-        'padding:8px 12px', 'border-radius:999px', 'letter-spacing:.2px',
-        'background:rgba(18,18,18,.94)', 'color:#fff',
-        'border:1px solid rgba(255,255,255,.16)',
-        'box-shadow:0 6px 22px rgba(0,0,0,.55)',
-        'cursor:pointer', 'user-select:none', 'max-width:76vw',
-        'white-space:nowrap', 'overflow:hidden', 'text-overflow:ellipsis',
-        'touch-action:manipulation',
-      ].join(';')
-    );
-    hudEl.title = 'Tap for diagnostics · long-press to hide';
-    hudEl.addEventListener('click', () => togglePanel());
+    hudEl.title = 'Tap for details';
+    hudEl.setAttribute('style', [
+      'position:fixed', 'top:56px', 'right:10px', 'z-index:2147483500',
+      'font:600 11px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+      'padding:7px 11px', 'border-radius:999px', 'letter-spacing:.2px',
+      'background:rgba(18,18,18,.94)', 'color:#fff',
+      'border:1px solid rgba(255,255,255,.16)',
+      'box-shadow:0 6px 22px rgba(0,0,0,.55)',
+      'cursor:pointer', 'user-select:none', 'max-width:70vw',
+      'white-space:nowrap', 'overflow:hidden', 'text-overflow:ellipsis',
+      'touch-action:manipulation', 'display:none',
+    ].join(';'));
+    hudEl.addEventListener('click', () => { togglePanel(); });
     document.documentElement.appendChild(hudEl);
-    ensureJumpButton();
-  }
-
-  let jumpBtn = null;
-
-  /**
-   * The ⬆ button: scrolls the conversation to the first message and re-reads the
-   * whole history, writing it to Firebase in order from scratch.
-   *
-   * It always clears the `messages` node first, so a half-finished earlier run
-   * cannot leave the database out of order. That is safe to do only when we can
-   * actually read the transcript, so the button refuses to wipe anything until
-   * it has seen at least one message.
-   */
-  function ensureJumpButton() {
-    if (!CONFIG.SHOW_HUD || jumpBtn) return;
-    jumpBtn = document.createElement('div');
-    jumpBtn.id = 'ig-relay-jump';
-    jumpBtn.textContent = '⬆';
-    jumpBtn.title = 'Tap: jump to the first message and re-sync · long-press: copy a page report';
-    jumpBtn.setAttribute(
-      'style',
-      [
-        'position:fixed', 'right:12px', 'bottom:56px', 'z-index:2147483001',
-        'width:42px', 'height:42px', 'border-radius:50%',
-        'display:flex', 'align-items:center', 'justify-content:center',
-        'background:linear-gradient(135deg,#7000FF,#A800FF)', 'color:#fff',
-        'font:700 19px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
-        'border:1px solid rgba(255,255,255,.28)',
-        'box-shadow:0 6px 22px rgba(0,0,0,.55)',
-        'cursor:pointer', 'user-select:none', 'touch-action:manipulation',
-      ].join(';')
-    );
-    // Tap  = jump to the first message and re-sync.
-    // Long-press (600 ms) = show/copy a report of what the page looks like, which
-    // is the only reliable way to debug a real Instagram DOM from a phone.
-    let pressTimer = null;
-    let longPressed = false;
-
-    const beginPress = (ev) => {
-      longPressed = false;
-      pressTimer = setTimeout(() => {
-        longPressed = true;
-        try { if (ev.cancelable) ev.preventDefault(); } catch (_) {}
-        copyDomReport();
-      }, 600);
-    };
-    const endPress = () => {
-      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
-    };
-
-    jumpBtn.addEventListener('pointerdown', beginPress);
-    jumpBtn.addEventListener('pointerup', endPress);
-    jumpBtn.addEventListener('pointercancel', endPress);
-    jumpBtn.addEventListener('pointerleave', endPress);
-    jumpBtn.addEventListener('contextmenu', (ev) => ev.preventDefault());
-
-    jumpBtn.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      endPress();
-      if (longPressed) { longPressed = false; return; }   // long-press already handled
-      startManualBackfill();
-    });
-    document.documentElement.appendChild(jumpBtn);
-  }
-
-  function setJumpButtonBusy(busy, glyph) {
-    if (!jumpBtn) return;
-    jumpBtn.textContent = glyph || (busy ? '…' : '⬆');
-    jumpBtn.style.opacity = busy ? '0.75' : '1';
-  }
-
-  async function startManualBackfill() {
-    if (STATE.inManualBackfill) { hud('⏳ Already reading history…', 'warn'); return; }
-
-    // A boot-time read may still be in flight. Wiping the node underneath it is
-    // exactly how duplicates got created, so queue behind it.
-    if (backfillLock) {
-      hud('⏳ Finishing the current read first…', 'warn');
-      try { await backfillLock; } catch (_) {}
-    }
-
-    const id = chatIdFromUrl();
-    if (!id || id !== String(CONFIG.TARGET_CHAT_ID)) {
-      hud('⏸ Open the MD.Soad chat first', 'warn');
-      return;
-    }
-
-    STATE.inManualBackfill = true;
-    setJumpButtonBusy(true, '…');
-
-    try {
-      // ── 1. COLLECT first, wipe afterwards ─────────────────────────────────
-      // Destructive-then-hope was the old order: if the read came back with a
-      // handful of rows we had already deleted everything. Now the database is
-      // only touched once a full history is actually in hand.
-      hud('⬆ Finding the first message…');
-      const jump = await jumpToFirstMessage((count, round, grew) => {
-        hud('⬆ Scrolling to the first message… ' + count + ' items (round ' + round + ')');
-        setJumpButtonBusy(true, grew ? '⬆' : '…');
-      });
-
-      if (!jump.ok) {
-        STATE.lastError = 'jump: ' + (jump.reason || 'unknown');
-        hud('⚠️ ' + (jump.reason || 'could not reach the top') + ' · tap for details', 'bad');
-        return;
-      }
-      if (!getBubbles().bubbles.length) {
-        hud('⚠️ No messages visible · long-press ⬆ for a report', 'bad');
-        return;
-      }
-
-      hud('📜 Reading the whole history…');
-      window.__relayWatchdog = makeWatchdog(() => {
-        hud('⚠️ History read stalled · DB left untouched', 'bad');
-        STATE.lastError = 'watchdog: read made no progress for ' + (READ_STALL_MS / 1000) + 's';
-      });
-      const all = await backfillAll((collected) => {
-        hud('📜 Reading history… ' + collected + ' messages');
-      });
-      window.__relayWatchdog = null;
-
-      if (!all || !all.length) {
-        STATE.lastError = 'backfill returned nothing';
-        hud('⚠️ Could not read history · DB left untouched', 'bad');
-        return;
-      }
-      if (all.length < MIN_HISTORY_TO_WIPE) {
-        hud('⚠️ Only ' + all.length + ' messages found (' + MIN_HISTORY_TO_WIPE +
-            ' needed) · DB left untouched', 'bad');
-        return;
-      }
-
-      // ── 2. now it is safe to replace the database ─────────────────────────
-      hud('🧹 Clearing old copy…');
-      try {
-        await clearMessagesNode();
-      } catch (e) {
-        STATE.lastError = 'clear: ' + e.message;
-        hud('⚠️ Could not clear the database · tap for details', 'bad');
-        return;
-      }
-      STATE.tail = [];
-      STATE.reactions.clear();
-      STATE.looseDedupe = false;
-      STATE.resetPushed = false;
-      STATE.wrote = 0;                     // the DB really is empty again
-
-      // ── 3. write oldest → newest ──────────────────────────────────────────
-      let n = 0;
-      for (const item of all) {
-        try {
-          await pushItem(item);
-          n++;
-          if (n % 3 === 0) hud('⬆ Saving history… ' + n + '/' + all.length);
-        } catch (e) {
-          WARN('history push failed', e.message);
-          STATE.lastError = e.message;
-          await sleep(400);
-        }
-        await sleep(CONFIG.POST_DELAY_MS);
-      }
-      STATE.resetPushed = true;
-
-      if (n) {
-        hud('✅ Saved all ' + n + ' messages · back to live', 'ok');
-        // return the reader to the newest message, then let live sync resume
-        try {
-          const sc = findThreadScroller();
-          if (sc) { sc.scrollTop = sc.scrollHeight; fireScrollHints(sc, 1); }
-        } catch (_) {}
-        STATE.holdScansUntil = nowMs() + 2500;
-        await sleep(2000);
-        STATE.inManualBackfill = false;
-        scan();
-      } else {
-        hud('⚠️ Nothing could be saved · tap for details', 'bad');
-      }
-    } catch (e) {
-      WARN('manual backfill failed', e);
-      STATE.lastError = e.message;
-      hud('⚠️ Refresh failed · tap for details', 'bad');
-    } finally {
-      STATE.inManualBackfill = false;
-      setJumpButtonBusy(false);
-    }
-  }
-
-  /** Below this, treat a "full read" as a failure and never delete anything. */
-  const MIN_HISTORY_TO_WIPE = 2;
-
-  /**
-   * Empty the messages node using *child* deletes. A `messages: {".write": true}`
-   * rule allows child writes but can refuse a delete of the node itself, and a
-   * failed DELETE used to abort the refresh silently.
-   */
-  async function clearMessagesNode() {
-    if (STATE.tail.length) {
-      const patches = {};
-      STATE.tail.forEach(({ key }) => { patches[key] = null; });
-      await fbRequest('PATCH', '.json', patches);
-      return;
-    }
-    const existing = await fbRequest('GET', '.json?shallow=true');
-    if (!existing || typeof existing !== 'object') return;
-    const patches = {};
-    Object.keys(existing).forEach((k) => { patches[k] = null; });
-    if (Object.keys(patches).length) await fbRequest('PATCH', '.json', patches);
   }
 
   function hud(text, tone) {
     if (!CONFIG.SHOW_HUD) return;
     ensureHud();
     if (!hudEl) return;
+    hudEl.style.display = 'block';
     if (text !== STATE.lastHudText) {
       STATE.lastHudText = text;
       hudEl.textContent = text;
@@ -403,13 +256,93 @@
     if (panelEl && panelEl.style.display !== 'none') renderPanel();
   }
 
+  /* ── ✅ marks beside saved messages ────────────────────────────────────────── */
+
+  function ensureMarksLayer() {
+    if (!CONFIG.SHOW_SAVED_MARKS || marksLayer) return;
+    marksLayer = el('div');
+    marksLayer.id = 'ig-relay-marks';
+    marksLayer.setAttribute('style',
+      'position:fixed;inset:0;pointer-events:none;z-index:2147483400;overflow:hidden');
+    document.documentElement.appendChild(marksLayer);
+  }
+
+  /** Remember that messages with this signature are already saved. */
+  function noteSaved(sig) {
+    const cur = markFor.get(sig) || { count: 0, badges: [] };
+    cur.count = Math.max(cur.count, savedCountOf(sig));
+    markFor.set(sig, cur);
+    scheduleMarks();
+  }
+
+  function savedCountOf(sig) {
+    return (STATE.sigCounts.get(sig) || 0) + (STATE.seenThisSession.get(sig) || 0);
+  }
+
+  function scheduleMarks() {
+    if (markRaf) return;
+    markRaf = requestAnimationFrame(() => { markRaf = 0; drawMarks(); });
+  }
+
+  /**
+   * Draw a ✅ next to each saved message. Purely decorative — positions are read
+   * from the live rects every frame, so scrolling and lazy-loading cannot desync
+   * it, and nothing is ever injected into Instagram's own DOM.
+   */
+  function drawMarks() {
+    if (!CONFIG.SHOW_SAVED_MARKS) return;
+    ensureMarksLayer();
+    if (!marksLayer) return;
+    if (!STATE.running && !markFor.size) { marksLayer.textContent = ''; return; }
+
+    const bubbles = (() => { try { return getBubbles().bubbles; } catch (_) { return []; } })();
+    if (!bubbles.length) {
+      marksLayer.textContent = '';
+      return;
+    }
+
+    const overflow = markFor.size > 400 ? null : null; // bounds are handled below
+    const html = [];
+    const used = new Map();
+
+    for (const b of bubbles) {
+      const r = b.getBoundingClientRect();
+      if (r.bottom < -20 || r.top > window.innerHeight + 20) continue;
+
+      let item;
+      try { item = extractRow(b); } catch (_) { continue; }
+      if (!item || isJunkItem(item)) continue;
+
+      const have = savedCountOf(item.sig);
+      if (!have) continue;
+
+      const nth = (used.get(item.sig) || 0) + 1;
+      used.set(item.sig, nth);
+      if (nth > have) continue;      // duplicate on screen that is not saved yet
+
+      const left = Math.min(window.innerWidth - 22, Math.max(4, r.right - 16));
+      html.push(
+        '<span style="position:absolute;left:' + Math.round(left) + 'px;top:' +
+        Math.round(r.top + 2) + 'px;color:#22c55e;font-size:12px;line-height:1;' +
+        'text-shadow:0 0 4px #000,0 0 2px #000">✅</span>'
+      );
+      if (html.length > 120) break;
+    }
+
+    marksLayer.innerHTML = html.join('');
+    if (overflow) { /* no-op, kept for clarity */ }
+  }
+
+  /* ── PANEL (diagnostics) ──────────────────────────────────────────────────── */
+
+  let panelEl = null;
+
   const esc = (s) =>
     String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
       { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
     ));
 
   function maskedUrl() {
-    // show host + whether /messages is attached, but not the whole thing
     try {
       const u = new URL(DB);
       return u.hostname + u.pathname.replace(/\/+$/, '');
@@ -425,150 +358,85 @@
   }
 
   function buildPanel() {
-    panelEl = document.createElement('div');
+    panelEl = el('div');
     panelEl.id = 'ig-relay-panel';
-    panelEl.setAttribute(
-      'style',
-      [
-        'position:fixed', 'right:10px', 'bottom:58px', 'z-index:2147483000',
-        'width:min(340px, 92vw)', 'max-height:58vh', 'overflow:auto',
-        'background:rgba(12,12,12,.98)', 'color:#eee',
-        'border:1px solid rgba(255,255,255,.16)', 'border-radius:14px',
-        'padding:12px 13px',
-        'font:500 11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
-        'box-shadow:0 14px 40px rgba(0,0,0,.7)', 'white-space:pre-wrap',
-        'word-break:break-word', 'display:none', '-webkit-user-select:text', 'user-select:text',
-      ].join(';')
-    );
+    panelEl.setAttribute('style', [
+      'position:fixed', 'right:10px', 'top:92px', 'z-index:2147483500',
+      'width:min(340px, 92vw)', 'max-height:62vh', 'overflow:auto',
+      'background:rgba(12,12,12,.98)', 'color:#eee',
+      'border:1px solid rgba(255,255,255,.16)', 'border-radius:14px',
+      'padding:12px 13px',
+      'font:500 11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+      'box-shadow:0 14px 40px rgba(0,0,0,.7)', 'white-space:pre-wrap',
+      'word-break:break-word', 'display:none', '-webkit-user-select:text', 'user-select:text',
+    ].join(';'));
     document.documentElement.appendChild(panelEl);
   }
 
-  /** The screen that actually tells you WHY it failed on a phone. */
   function renderPanel() {
     if (!panelEl) return;
-    const id = chatIdFromUrl();
-    const gm = !!GMXHR;
-    const rows = safeRowCount();
-    const diag = classify();
+    const s = currentState();
+    const bubbles = (() => { try { return getBubbles().bubbles.length; } catch (_) { return -1; } })();
     const lines = [
       `IG Relay v${VERSION}`,
       ``,
-      `thread in URL : ${id || '(none — not a /direct/t/ page)'}`,
-      `target thread : ${String(CONFIG.TARGET_CHAT_ID)}`,
-      `match         : ${id === String(CONFIG.TARGET_CHAT_ID) ? 'YES' : 'NO'}`,
-      `state         : ${STATE.paused ? 'PAUSED' : STATE.ready ? 'LIVE' : 'starting'}`,
-      ``,
-      `database      : ${maskedUrl()}`,
-      `transport     : ${STATE.transport === 'gm' ? 'GM_xmlhttpRequest ✓' : STATE.transport === 'fetch' ? (gm ? 'fetch (GM failed — blocked?)' : 'fetch (no GM grant)') : 'not used yet'}`,
-      `GM available  : ${gm ? 'yes' : 'NO — check @grant lines'}`,
-      `last HTTP     : ${STATE.lastStatus == null ? '—' : STATE.lastStatus}`,
-      `rows found    : ${rows}`,
-      `relayed       : ${STATE.wrote}`,
+      `state         : ${s.label.toUpperCase()}`,
+      `hint          : ${s.hint}`,
+      `match         : ${chatIdFromUrl() === String(CONFIG.TARGET_CHAT_ID) ? 'YES' : 'NO'}`,
+      `messages now  : ${bubbles}`,
+      `saved session : ${STATE.wrote}`,
       `known in DB   : ${STATE.tail.length}`,
       `last scan     : ${STATE.lastScanAt ? Math.round((nowMs() - STATE.lastScanAt) / 1000) + 's ago' : '—'}`,
       ``,
-      `── what the page looks like ──`,
-      `composer      : ${safeFind('#composer', () => (findComposer() ? 'found' : 'NOT FOUND'))}`,
-      `transcript    : ${safeFind('#transcript', () => {
-        const sc = findThreadScroller();
-        if (!sc) return 'NOT FOUND';
-        return sc.scrollHeight + 'px / ' + sc.clientHeight + 'px, ' +
-               sc.querySelectorAll('[dir="auto"]').length + ' text nodes';
-      })}`,
-      `text nodes    : ${safeFind('#textnodes', () => document.querySelectorAll('[dir="auto"]').length)}`,
-      `listboxes     : ${safeFind('#listboxes', () => document.querySelectorAll('[role="listbox"]').length)}`,
-      `scroll boxes  : ${safeFind('#scrollboxes', () => scrollBoxSummary())}`,
-      `url           : ${location.pathname.slice(0, 60)}`,
+      `database      : ${maskedUrl()}`,
+      `transport     : ${STATE.transport === 'gm' ? 'GM_xmlhttpRequest ✓' : STATE.transport === 'fetch' ? 'fetch' : 'not used yet'}`,
+      `last HTTP     : ${STATE.lastStatus == null ? '—' : STATE.lastStatus}`,
     ];
-
     if (STATE.lastError) lines.push('', `last error    : ${STATE.lastError}`);
-    lines.push('', '── report · long-press ⬆ to copy ──');
-    try { lines.push(domReport()); } catch (e) { lines.push('report failed: ' + e.message); }
-    if (diag) lines.push('', `⚠️ ${diag.title}`, diag.hint);
+    lines.push('', '── page report ──');
+    try { lines.push(pageReport()); } catch (e) { lines.push('report failed: ' + e.message); }
 
-    panelEl.innerHTML =
-      lines
-        .map((l) => {
-          if (/^IG Relay/.test(l)) return `<b style="color:#c084fc">${esc(l)}</b>`;
-          if (/^⚠️/.test(l)) return `<b style="color:#ffb4a2">${esc(l)}</b>`;
-          if (/^(database|transport|last HTTP|last error)/.test(l)) return `<span style="color:#9ad">${esc(l)}</span>`;
-          if (/^(thread in URL|match|state|rows found)/.test(l)) return `<span style="color:#dfe">${esc(l)}</span>`;
-          return esc(l);
-        })
-        .join('\n') +
+    panelEl.innerHTML = lines
+      .map((l) => {
+        if (/^IG Relay/.test(l)) return `<b style="color:#c084fc">${esc(l)}</b>`;
+        if (/^last error/.test(l)) return `<b style="color:#ffb4a2">${esc(l)}</b>`;
+        if (/^(database|transport|last HTTP)/.test(l)) return `<span style="color:#9ad">${esc(l)}</span>`;
+        if (/^(state|match|messages now|saved session)/.test(l)) return `<span style="color:#dfe">${esc(l)}</span>`;
+        return esc(l);
+      })
+      .join('\n') +
       `<div style="margin-top:10px;padding-top:9px;border-top:1px solid #2a2a2a;color:#888;font-family:system-ui">
-         <b style="color:#c084fc">⬆ button</b> = jump to the first message and re-sync everything.<br>
-         <b style="color:#c084fc">Long-press ⬆</b> = copy a report of what the page looks like.<br>
-         Tap the pill to close.
+         Tap the pill to close. Long-press ▶ to copy this report.
        </div>`;
   }
 
-  /**
-   * A one-tap description of the real page. Built because a phone has no console:
-   * the ⬆ button long-press copies this, and it is also shown in the panel.
-   */
-  function domReport() {
+  function pageReport() {
     const sc = findThreadScroller();
-    const composer = findComposer();
     const bubbles = (() => { try { return getBubbles().bubbles; } catch (_) { return []; } })();
-    const lines = [];
-    lines.push('IG RELAY ' + VERSION);
-    lines.push('url: ' + location.pathname);
-    lines.push('thread: ' + (chatIdFromUrl() || 'none') + ' / target ' + CONFIG.TARGET_CHAT_ID);
-    lines.push('composer: ' + (composer ? 'FOUND' : 'NOT FOUND'));
+    const out = [];
+    out.push('url: ' + location.pathname);
+    out.push('composer: ' + (findComposer() ? 'FOUND' : 'NOT FOUND'));
     if (sc) {
-      lines.push('transcript: ' + sc.tagName.toLowerCase() +
-        (sc.getAttribute('role') ? '[role=' + sc.getAttribute('role') + ']' : '') +
-        (sc.getAttribute('aria-label') ? '[aria-label=' + sc.getAttribute('aria-label') + ']' : '') +
-        ' h=' + sc.scrollHeight + ' ch=' + sc.clientHeight + ' top=' + Math.round(sc.scrollTop));
+      out.push('transcript: h=' + sc.scrollHeight + ' ch=' + sc.clientHeight +
+               ' top=' + Math.round(sc.scrollTop) + ' kids=' + sc.children.length);
+      if (sc.__relayDebug) out.push('  ' + sc.__relayDebug);
     } else {
-      lines.push('transcript: NOT FOUND');
+      out.push('transcript: NOT FOUND');
     }
-    lines.push('bubbles detected: ' + bubbles.length);
-    lines.push('text nodes ([dir=auto]): ' + document.querySelectorAll('[dir="auto"]').length);
-    lines.push('listboxes: ' + document.querySelectorAll('[role="listbox"]').length);
-    lines.push('imgs total: ' + document.querySelectorAll('img').length);
-
-    // the scrollable boxes, biggest first — this is what the detector picks from
-    const boxes = [];
-    document.querySelectorAll('div, main, section, ul').forEach((el) => {
-      try {
-        const st = getComputedStyle(el);
-        if (!/(auto|scroll)/.test(st.overflowY)) return;
-        if (el.scrollHeight < 150) return;
-        const r = el.getBoundingClientRect();
-        if (r.width < 80 || r.height < 80) return;
-        boxes.push({
-          label: (el.getAttribute('aria-label') || el.getAttribute('role') || el.tagName).slice(0, 24),
-          over: el.scrollHeight - el.clientHeight,
-          kids: el.children.length,
-          texts: el.querySelectorAll('[dir="auto"]').length,
-          imgs: el.querySelectorAll('img').length,
-        });
-      } catch (_) {}
-    });
-    boxes.sort((a, b) => b.over - a.over);
-    lines.push('');
-    lines.push('scroll boxes (label | overflow | children | texts | imgs):');
-    boxes.slice(0, 5).forEach((b) => {
-      lines.push('  ' + b.label + ' | ' + b.over + 'px | ' + b.kids + ' | ' + b.texts + ' | ' + b.imgs);
-    });
-    if (!boxes.length) lines.push('  (none — nothing on this page scrolls)');
-
-    // what the first few detected messages actually are
-    lines.push('');
-    lines.push('first detected:');
-    bubbles.slice(0, 5).forEach((b, i) => {
+    out.push('bubbles: ' + bubbles.length);
+    out.push('text nodes: ' + document.querySelectorAll('[dir="auto"]').length);
+    out.push('first detected:');
+    bubbles.slice(0, 6).forEach((b, i) => {
       const r = b.getBoundingClientRect();
-      lines.push('  ' + i + ': "' + (b.innerText || '').replace(/\n/g, ' ').slice(0, 34) +
-        '" ' + Math.round(r.width) + 'x' + Math.round(r.height));
+      out.push('  ' + i + ': "' + (b.innerText || '').replace(/\n/g, ' ').slice(0, 30) +
+               '" ' + Math.round(r.width) + 'x' + Math.round(r.height));
     });
-    if (!bubbles.length) lines.push('  (nothing detected)');
-    return lines.join('\n');
+    if (!bubbles.length) out.push('  (nothing detected)');
+    return out.join('\n');
   }
 
-  async function copyDomReport() {
-    const text = domReport();
+  async function copyReport() {
+    const text = pageReport();
     let copied = false;
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -577,145 +445,42 @@
       }
     } catch (_) {}
     if (!copied) {
-      // clipboard API is often blocked on mobile — fall back to a selectable box
-      const box = document.createElement('textarea');
+      const box = el('textarea');
       box.value = text;
       box.setAttribute('style',
         'position:fixed;left:6px;right:6px;top:6px;height:38vh;z-index:2147483647;' +
         'background:#000;color:#0f0;font:11px ui-monospace,monospace;border:2px solid #A800FF;' +
         'border-radius:10px;padding:8px;white-space:pre;overflow:auto');
       document.documentElement.appendChild(box);
-      box.focus();
-      box.select();
+      box.focus(); box.select();
       setTimeout(() => { try { box.remove(); } catch (_) {} }, 30000);
     }
-    hud(copied ? '📋 Report copied' : '📋 Report shown — select & copy it', 'ok');
-    STATE.lastReport = text;
-    return text;
-  }
-
-  function safeRowCount() {
-    try { return getBubbles().bubbles.length; } catch (_) { return -1; }
-  }
-
-  function safeFind(label, fn) {
-    try { return String(fn()); } catch (e) { return 'error: ' + e.message; }
-  }
-
-  /** One line describing the biggest scroll containers on the page. */
-  function scrollBoxSummary() {
-    const out = [];
-    document.querySelectorAll('div, main, section, ul').forEach((el) => {
-      try {
-        const st = getComputedStyle(el);
-        if (!/(auto|scroll)/.test(st.overflowY)) return;
-        if (el.scrollHeight < 200) return;
-        const label = el.getAttribute('aria-label') || el.getAttribute('role') || el.tagName.toLowerCase();
-        out.push(label + ' ' + (el.scrollHeight - el.clientHeight) + 'px');
-      } catch (_) {}
-    });
-    if (!out.length) return 'none (nothing scrolls — is the chat open?)';
-    return out.slice(0, 3).join(' · ');
-  }
-
-  /** Turns a raw failure into an actionable explanation. */
-  function classify() {
-    const raw = STATE.lastError || '';
-    const status = STATE.lastStatus;
-    const dbHost = (() => { try { return new URL(DB).hostname; } catch (_) { return ''; } })();
-
-    if (!/^https?:\/\//i.test(DB)) {
-      return { title: 'FIREBASE_DB_URL is not a full URL', hint: 'It must start with https:// and be copied exactly from the Firebase console.' };
-    }
-    if (/YOUR-PROJECT-ID/.test(DB) || !/firebaseio\.com|firebasedatabase\.app/.test(DB)) {
-      return { title: 'FIREBASE_DB_URL still has the placeholder', hint: 'Replace YOUR-PROJECT-ID with your real project id, keep /messages on the end.' };
-    }
-    if (/YOUR_THREAD_ID/.test(String(CONFIG.TARGET_CHAT_ID))) {
-      return { title: 'TARGET_CHAT_ID still has the placeholder', hint: 'Copy the digits from instagram.com/direct/t/<DIGITS>/ in the address bar.' };
-    }
-    if (!dbHost) {
-      return { title: 'database URL cannot be parsed', hint: 'Check for a typo, a stray space, or a missing https://' };
-    }
-    if (status === 401 || status === 403) {
-      return {
-        title: `Firebase denied the request (${status})`,
-        hint:
-          'Your Realtime Database rules block reads. Open Firebase → Realtime Database → Rules and set:\n' +
-          '{ "rules": { "messages": { ".read": true, ".write": true } } }\nThen tap Publish and reload Instagram.',
-      };
-    }
-    if (status === 404) {
-      return {
-        title: 'Firebase returned 404 — wrong database URL',
-        hint:
-          `It asked for: ${dbHost}\n` +
-          'Region matters. An asia-southeast1 project is on *.firebasedatabase.app, not *.firebaseio.com. ' +
-          'Copy the URL straight from the console header.',
-      };
-    }
-    if (status === 400) {
-      return { title: 'Firebase rejected the request (400)', hint: 'Usually a malformed URL (double slashes) or a bad query.' };
-    }
-    if (/network|timeout|abort|NS_ERROR|Load failed|Failed to fetch|NetworkError/i.test(raw)) {
-      return {
-        title: 'No connection to Firebase',
-        hint:
-          'Firefox/Tampermonkey blocked the request or you are offline.\n' +
-          '• Make sure the script header still lists @connect for firebaseio.com / firebasedatabase.app\n' +
-          '• On Firefox Android: Settings → Data collection → turn OFF "Block trackers" for instagram.com\n' +
-          '• Check the phone is online, then reload the Instagram tab.',
-      };
-    }
-    if (/CORS|TypeError: NetworkError/i.test(raw)) {
-      return {
-        title: 'Blocked as a cross-site request (CORS)',
-        hint: 'GM_xmlhttpRequest was unavailable, so fetch() was used and blocked. Re-install the script so its @grant lines apply.',
-      };
-    }
-    if (raw) return { title: 'Firebase request failed', hint: raw };
-    return null;
+    hud(copied ? '📋 Report copied' : '📋 Select & copy the report', 'ok');
   }
 
   /* ===================================================================================
-   * 4. HTTP LAYER (GM_xmlhttpRequest first — bypasses Instagram CSP and Firebase CORS)
+   * 4. FIREBASE (REST)
    * =================================================================================== */
 
-  // Tampermonkey on Firefox exposes the modern GM.xmlHttpRequest; older builds use
-  // GM_xmlhttpRequest. Support both so the phone never silently falls back to fetch().
-  const GMXHR =
-    (typeof GM_xmlhttpRequest === 'function' && GM_xmlhttpRequest) ||
-    (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function'
-      ? GM.xmlHttpRequest.bind(GM)
-      : null);
-
+  const GMXHR = (typeof GM_xmlhttpRequest === 'function' && GM_xmlhttpRequest) ||
+    (typeof GM !== 'undefined' && GM && GM.xmlHttpRequest) || null;
   const hasGM = !!GMXHR;
 
   function gmRequest(opts) {
     return new Promise((resolve, reject) => {
-      let handle;
-      const settle = (fn, v) => { try { fn(v); } catch (_) {} };
       try {
-        handle = GMXHR(
-          Object.assign({}, opts, {
-            onload: (r) => settle(resolve, r),
-            onerror: (e) => settle(reject, new Error('network error' + (e && e.error ? ': ' + e.error : ''))),
-            ontimeout: () => settle(reject, new Error('timeout')),
-            onabort: () => settle(reject, new Error('abort')),
-            onreadystatechange: (r) => {
-              // some Firefox builds report progress through this path only
-              if (r && r.readyState === 4 && r.status >= 200 && r.status < 300 && !r.responseText && opts.responseType === 'arraybuffer') {
-                settle(resolve, r);
-              }
-            },
-          })
-        );
-      } catch (e) {
-        settle(reject, e);
-      }
-      // GM.xmlHttpRequest returns a promise-like with .abort(); keep a safety net
-      if (handle && typeof handle.then === 'function') {
-        handle.then(() => {}, () => {});
-      }
+        GMXHR({
+          method: opts.method,
+          url: opts.url,
+          headers: opts.headers || {},
+          data: opts.data,
+          responseType: opts.responseType || 'text',
+          timeout: opts.timeout || 25000,
+          onload: resolve,
+          onerror: (e) => reject(new Error('network error')),
+          ontimeout: () => reject(new Error('timeout')),
+        });
+      } catch (e) { reject(e); }
     });
   }
 
@@ -724,7 +489,6 @@
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const headers = { 'Content-Type': 'application/json' };
 
-    // ── 1. extension transport (preferred: immune to CORS and page CSP) ──────────
     if (hasGM) {
       try {
         const r = await gmRequest({ method, url, headers, data: payload, timeout: 25000 });
@@ -738,40 +502,118 @@
         STATE.lastError = 'FB ' + r.status + ' ' + snippet;
         const err = new Error(STATE.lastError);
         err.status = r.status;
-        err.final = r.status === 401 || r.status === 403 || r.status === 404;  // no point retrying
+        err.final = r.status === 401 || r.status === 403 || r.status === 404;
         throw err;
       } catch (e) {
         if (e && e.final) throw e;
-        // transport-level failure → try the page transport before giving up
-        VLOG('GM transport failed, trying fetch:', e.message);
         if (!e.status) STATE.lastError = e.message;
       }
     }
 
-    // ── 2. page transport fallback ───────────────────────────────────────────────
-    try {
-      STATE.transport = 'fetch';
-      const res = await fetch(url, { method, headers, body: payload, cache: 'no-store' });
-      STATE.lastStatus = res.status;
-      if (!res.ok) {
-        const txt = (await res.text()).slice(0, 200);
-        STATE.lastError = 'FB ' + res.status + ' ' + txt;
-        const err = new Error(STATE.lastError);
-        err.status = res.status;
-        throw err;
-      }
-      STATE.lastError = '';
-      const txt = await res.text();
-      return txt ? JSON.parse(txt) : null;
-    } catch (e) {
-      if (!e.status) STATE.lastError = e.message;
-      throw e;
+    STATE.transport = 'fetch';
+    const res = await fetch(url, { method, headers, body: payload, cache: 'no-store' });
+    STATE.lastStatus = res.status;
+    if (!res.ok) {
+      const txt = (await res.text()).slice(0, 200);
+      STATE.lastError = 'FB ' + res.status + ' ' + txt;
+      const err = new Error(STATE.lastError);
+      err.status = res.status;
+      throw err;
     }
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
   }
+
+  /** Load the signature index of everything already in the database. */
+  async function loadIndex() {
+    const q = '?orderBy=' + encodeURIComponent('"$key"') + '&limitToLast=' + CONFIG.HISTORY_LOOKBACK;
+    const data = await fbRequest('GET', '.json' + q);
+    const entries = data && typeof data === 'object' ? Object.entries(data) : [];
+    entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+
+    STATE.tail = entries.map(([key, v]) => ({ key, sig: (v && v.sig) || '' }));
+    STATE.sigCounts = new Map();
+    STATE.reactions.clear();
+    entries.forEach(([key, v]) => {
+      const sig = v && v.sig;
+      if (sig) STATE.sigCounts.set(sig, (STATE.sigCounts.get(sig) || 0) + 1);
+      STATE.reactions.set(key, v && v.reactions ? v.reactions : null);
+    });
+    markFor.clear();
+    scheduleMarks();
+
+    // Existing rows may carry `seq`, which tells us how they were ordered.
+    const withSeq = entries.filter(([, v]) => v && typeof v.seq === 'number');
+    if (withSeq.length >= Math.max(3, entries.length * 0.6)) {
+      entries.forEach(([, v]) => { if (v && v.sig && typeof v.seq === 'number') STATE.posSeq.set(v.sig, v.seq); });
+      STATE.posMode = 'forward';
+    }
+    LOG('index loaded:', STATE.tail.length, 'rows,', STATE.sigCounts.size,
+        'distinct signatures, order mode:', withSeq.length ? 'forward' : 'newest-first');
+  }
+
+  async function pushItem(item) {
+    const media = await prepareMedia(item);
+
+    // If the message carried media we could not obtain, record that honestly
+    // instead of saving an empty bubble the viewer can never fill.
+    if (media.failed) {
+      const label = {
+        photo: "⚠️ Can't load this photo!",
+        reel: "⚠️ Can't load this reel!",
+        voice: "⚠️ Can't load this audio!",
+        video: "⚠️ Can't load this video!",
+        file: "⚠️ Can't load this file!",
+      }[item.kind] || "⚠️ Can't load this message!";
+      const payload = {
+        side: item.side,
+        kind: item.kind,
+        text: '',
+        ts: nowMs(),
+        sig: item.sig,
+        author: item.side === 'me' ? 'Orin' : 'MD.Soad',
+        failed: label,
+      };
+      if (item.reel) payload.reel = item.reel;
+      if (STATE.posMode === 'forward' && STATE.posSeq.has(item.sig)) payload.seq = STATE.posSeq.get(item.sig);
+      const r2 = await fbRequest('POST', '.json', payload);
+      const k2 = r2 && r2.name;
+      if (!k2) throw new Error('no key returned');
+      STATE.tail.push({ key: k2, sig: item.sig });
+      STATE.sigCounts.set(item.sig, (STATE.sigCounts.get(item.sig) || 0) + 1);
+      STATE.seenThisSession.set(item.sig, (STATE.seenThisSession.get(item.sig) || 0) + 1);
+      noteSaved(item.sig);
+      STATE.wrote++;
+      return k2;
+    }
+
+    const payload = buildPayload(item, media);
+    const res = await fbRequest('POST', '.json', payload);
+    const key = res && res.name;
+    if (!key) throw new Error('no key returned');
+
+    STATE.tail.push({ key, sig: item.sig });
+    if (STATE.tail.length > CONFIG.HISTORY_LOOKBACK * 2) {
+      STATE.tail.splice(0, STATE.tail.length - CONFIG.HISTORY_LOOKBACK);
+    }
+    STATE.sigCounts.set(item.sig, (STATE.sigCounts.get(item.sig) || 0) + 1);
+    STATE.seenThisSession.set(item.sig, (STATE.seenThisSession.get(item.sig) || 0) + 1);
+    noteSaved(item.sig);
+    STATE.wrote++;
+    return key;
+  }
+
+  async function patchReactions(key, value) {
+    await fbRequest('PATCH', '/' + key + '.json', { reactions: value || null });
+    STATE.reactions.set(key, value || null);
+  }
+
+  /* ===================================================================================
+   * 5. MEDIA HELPERS
+   * =================================================================================== */
 
   async function getBytes(url) {
     if (!url) return null;
-    // blob: URLs are same-origin and readable straight from the page.
     if (url.startsWith('blob:')) {
       const r = await fetch(url);
       if (!r.ok) throw new Error('blob ' + r.status);
@@ -782,7 +624,8 @@
       try {
         const r = await gmRequest({ method: 'GET', url, responseType: 'arraybuffer', timeout: 25000 });
         if (r.status >= 200 && r.status < 300 && r.response) {
-          return { buf: r.response, mime: r.responseHeaders?.match(/content-type:\s*([^\r\n;]+)/i)?.[1] || 'image/jpeg' };
+          const mime = r.responseHeaders?.match(/content-type:\s*([^\r\n;]+)/i)?.[1] || 'image/jpeg';
+          return { buf: r.response, mime };
         }
       } catch (_) { /* fall through */ }
     }
@@ -805,13 +648,13 @@
   function loadImageFromUrl(url) {
     return new Promise((resolve, reject) => {
       const img = new Image();
+      img.crossOrigin = 'anonymous';
       img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error('decode failed'));
+      img.onerror = () => reject(new Error('image load failed'));
       img.src = url;
     });
   }
 
-  /** Downscale to <= maxPx and re-encode as JPEG (Instagram CDN URLs expire → must inline). */
   async function toCompressedDataUrl(buf, mime, maxPx, quality) {
     const blob = new Blob([buf], { type: mime || 'image/jpeg' });
     const objUrl = URL.createObjectURL(blob);
@@ -819,20 +662,13 @@
       const img = await loadImageFromUrl(objUrl);
       const w = img.naturalWidth || img.width;
       const h = img.naturalHeight || img.height;
+      if (!w || !h) throw new Error('zero-size image');
       const scale = Math.min(1, maxPx / Math.max(w, h));
-      const cw = Math.max(1, Math.round(w * scale));
-      const ch = Math.max(1, Math.round(h * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = cw;
-      canvas.height = ch;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, cw, ch);
-      ctx.drawImage(img, 0, 0, cw, ch);
-      return canvas.toDataURL('image/jpeg', quality);
-    } catch (e) {
-      // Undecodable (rare) — inline the raw bytes so the image is still preserved.
-      return 'data:' + (mime || 'image/jpeg') + ';base64,' + abToBase64(buf);
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(w * scale));
+      c.height = Math.max(1, Math.round(h * scale));
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      return c.toDataURL('image/jpeg', quality);
     } finally {
       URL.revokeObjectURL(objUrl);
     }
@@ -860,7 +696,7 @@
   }
 
   /* ===================================================================================
-   * 5. DOM HELPERS
+   * 6. PAGE SCAFFOLDING — where is the conversation?
    * =================================================================================== */
 
   function chatIdFromUrl() {
@@ -868,17 +704,6 @@
     return m ? m[1] : null;
   }
 
-  /**
-   * ─────────────────────────────────────────────────────────────────────────────
-   * MESSAGE DISCOVERY
-   * ─────────────────────────────────────────────────────────────────────────────
-   * Instagram's class names and roles change constantly, so we avoid relying on
-   * them. The one thing every Direct layout has is the composer ("Message…").
-   * Everything ABOVE it in the same scroll container is the conversation, and the
-   * conversation list sits beside it. That anchor is what makes this reliable.
-   */
-
-  /** The message composer box (input / contenteditable). */
   function findComposer() {
     const sel = [
       '[contenteditable="true"][role="textbox"]',
@@ -898,7 +723,6 @@
     return null;
   }
 
-  /** True when the element is a real scroll container with overflow content. */
   function isScrollable(el) {
     if (!el || !el.getBoundingClientRect) return false;
     try {
@@ -908,13 +732,6 @@
     } catch (_) { return false; }
   }
 
-  /**
-   * Softer test used while resolving the transcript: an `overflow-y:auto` box
-   * that is not scrolling *yet* is still the right container — Instagram fills
-   * it lazily, and a chat whose messages currently fit the screen has
-   * scrollHeight === clientHeight until more history is loaded. Rejecting those
-   * was why backfill could not start on short/idle threads.
-   */
   function canScroll(el) {
     if (!el || !el.getBoundingClientRect) return false;
     try {
@@ -925,237 +742,153 @@
     } catch (_) { return false; }
   }
 
+  function looksLikeRail(el) {
+    return !!el.closest('nav, [aria-label*="Chats" i], [aria-label*="Inbox" i], [aria-label*="Conversations" i]') ||
+      !!el.querySelector('a[href*="/direct/t/"]');
+  }
+
   /**
-   * ─────────────────────────────────────────────────────────────────────────────
-   * THREAD SCAFFOLDING
-   * ─────────────────────────────────────────────────────────────────────────────
-   * Verified against how Instagram's Direct DOM looks as of the 2025/26 rewrite:
-   * the message transcript is a `div[role="listbox"]` (usually aria-label
-   * "Messages"), and individual messages NO LONGER have role="row"/role="grid".
-   * So we locate the transcript by role/aria-label first, then by geometry.
+   * The scrollable region that holds the conversation.
+   *
+   * Your page reports no `role="listbox"`, so we cannot rely on it. The composer
+   * is the reliable anchor: the transcript is the scrollable box ABOVE it and
+   * NOT containing it.
    */
   function findThreadScroller() {
     const composer = findComposer();
     const composerTop = composer ? composer.getBoundingClientRect().top : window.innerHeight;
+
     const holdsMessages = (el) => {
       if (!el) return false;
-      if (el.querySelectorAll('[dir="auto"], img, audio, video').length < 1) return false;
-      // never the inbox rail
-      if (el.querySelector('a[href*="/direct/t/"]')) return false;
-      return true;
+      if (looksLikeRail(el)) return false;
+      return el.querySelectorAll('[dir="auto"], img, audio, video').length >= 1;
     };
 
-    // ── Signal 1: the transcript listbox / Messages region ───────────────────
-    // NOTE: these are often NOT scrollable themselves — Instagram puts the
-    // scroller in a wrapper. So we resolve the *effective* scroller afterwards.
-    const listboxCandidates = [];
-    const pushCand = (el) => {
-      if (!el || el.closest('[role="dialog"]')) return;
-      if (!holdsMessages(el)) return;
-      const r = el.getBoundingClientRect();
+    // 1. explicit transcript markers, when the build has them
+    const explicit = [];
+    document.querySelectorAll('[role="listbox"], [aria-label*="Messages" i]').forEach((e) => {
+      if (e.closest('[role="dialog"]')) return;
+      if (!holdsMessages(e)) return;
+      const r = e.getBoundingClientRect();
       if (r.height < 120) return;
-      if (!listboxCandidates.includes(el)) listboxCandidates.push(el);
-    };
-    document.querySelectorAll('div[role="listbox"], [role="listbox"]').forEach(pushCand);
-    document.querySelectorAll('[aria-label*="Messages" i]').forEach(pushCand);
-
-    for (const cand of listboxCandidates) {
+      explicit.push(e);
+    });
+    for (const cand of explicit) {
       if (isScrollable(cand)) return cand;
-      if (canScroll(cand)) return cand;   // right container, content not overflowing yet
-      // walk up: the wrapper that actually scrolls
-      let el = cand.parentElement;
-      for (let i = 0; i < 8 && el && el !== document.body; i++, el = el.parentElement) {
-        if (isScrollable(el) && !el.querySelector('a[href*="/direct/t/"]')) return el;
+      let up = cand.parentElement;
+      for (let i = 0; i < 8 && up && up !== document.body; i++, up = up.parentElement) {
+        if (isScrollable(up) && !looksLikeRail(up)) return up;
       }
-      // walk down: some builds scroll an inner child
       const inner = Array.from(cand.querySelectorAll('div, ul'))
-        .filter((e) => (isScrollable(e) || canScroll(e)) && !e.querySelector('a[href*="/direct/t/"]'))
+        .filter((e) => isScrollable(e) && !looksLikeRail(e))
         .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
       if (inner) return inner;
+      if (canScroll(cand)) return cand;
     }
 
-    /** Scroll container, or a scroll-capable box already holding several messages. */
-    const scrollsThread = (el) => {
-      if (!el) return false;
-      if (isScrollable(el)) return true;
-      if (!canScroll(el)) return false;
-      return el.querySelectorAll('[dir="auto"], img, audio, video').length >= 2;
-    };
+    // 2. the scrollable box above the composer
+    const cands = [];
+    document.querySelectorAll('div, section, main, ul').forEach((e) => {
+      if (e === document.body || e === document.documentElement) return;
+      if (composer && e.contains(composer)) return;      // the composer itself / its wrapper
+      if (looksLikeRail(e)) return;
+      if (!holdsMessages(e)) return;
+      const r = e.getBoundingClientRect();
+      if (r.width < 120 || r.height < 120) return;
+      if (r.top < -8) return;                            // header / off-screen
+      if (r.bottom > composerTop + 8) return;            // must sit above the input
+      // Must be scroll-CAPABLE, not necessarily overflowing: a short chat (or a
+      // freshly opened thread that has only loaded the last screenful) has
+      // scrollHeight === clientHeight and would otherwise be rejected.
+      if (!isScrollable(e) && !canScroll(e)) return;
+      if (e.querySelectorAll('[dir="auto"], img, audio, video').length < 2) return;
+      const over = e.scrollHeight - e.clientHeight;
+      cands.push({ e, over, texts: e.querySelectorAll('[dir="auto"]').length });
+    });
 
-    // ── Signal 2: aria-label "Message" (singular) region ─────────────────────
-    for (const el of document.querySelectorAll('[aria-label*="Message" i]')) {
-      if (el.closest('[role="dialog"]')) continue;
-      if (!holdsMessages(el)) continue;
-      if (scrollsThread(el)) return el;
+    if (cands.length) {
+      // the transcript is the one with the most content, not the tallest
+      cands.sort((a, b) => (b.texts + b.over / 1000) - (a.texts + a.over / 1000));
+      return cands[0].e;
     }
 
-    // ── Signal 3: nearest scrollable ancestor of the composer ────────────────
-    if (composer) {
-      let el = composer.parentElement;
-      for (let i = 0; i < 14 && el && el !== document.body; i++, el = el.parentElement) {
-        if (scrollsThread(el) && !el.querySelector('a[href*="/direct/t/"]')) return el;
-      }
-
-      // ── Signal 4: sibling scrollable above the composer ────────────────────
-      let node = composer.parentElement;
-      for (let depth = 0; depth < 6 && node && node !== document.body; depth++, node = node.parentElement) {
-        const cands = Array.from(node.querySelectorAll('div, section, ul, main'))
-          .filter((el) => el !== node && !el.contains(composer))
-          .filter((el) => {
-            if (!scrollsThread(el) || !holdsMessages(el)) return false;
-            const r = el.getBoundingClientRect();
-            if (r.height < 120) return false;
-            return r.bottom <= composerTop + 8;
-          });
-        if (cands.length) {
-          cands.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
-          return cands[0];
-        }
-      }
-    }
-
-    // ── Signal 5: biggest scrollable region holding message-like content ─────
+    // 3. last resort: biggest scrollable box anywhere that is not the rail
     let best = null;
-    let bestScore = 0;
-    document.querySelectorAll('div, section, main, ul').forEach((el) => {
-      if (!scrollsThread(el) || !holdsMessages(el)) return;
-      if (el.closest('nav, [aria-label*="Chats" i], [aria-label*="Inbox" i]')) return;
-      // rank by overflow, then by how many messages it already holds
-      const score = (el.scrollHeight - el.clientHeight) +
-                    Math.min(60, el.querySelectorAll('[dir="auto"]').length * 10);
-      if (score > bestScore && el.clientHeight > 150) { bestScore = score; best = el; }
+    let score = 0;
+    document.querySelectorAll('div, section, main, ul').forEach((e) => {
+      if (looksLikeRail(e) || !isScrollable(e) || !holdsMessages(e)) return;
+      const s = (e.scrollHeight - e.clientHeight) + e.querySelectorAll('[dir="auto"]').length * 20;
+      if (s > score && e.clientHeight > 150) { score = s; best = e; }
     });
     return best;
   }
 
-  /** Does this element look like a single message (text, photo, audio, reel…)? */
-  function looksLikeMessage(el) {
-    if (!el || el.nodeType !== 1) return false;
-    if (el.closest('[role="dialog"]')) return false;
-    if (el.querySelector('a[href*="/direct/t/"]')) return false;      // inbox row
-    const rect = el.getBoundingClientRect();
-    if (rect.height < 10 || rect.width < 40) return false;           // hidden measure node
-    const txt = (el.innerText || '').trim();
-    const media = el.querySelector('audio, video') ||
-      Array.from(el.querySelectorAll('img')).find((im) => !isLikelyAvatarImg(im));
-    if (!txt && !media) return false;
-    // a message holds exactly ONE block of text (a container holds many)
-    const texts = el.querySelectorAll('[dir="auto"]');
-    if (texts.length > 2) return false;
-    if (rect.height > MAX_BUBBLE_HEIGHT) return false;
-    return true;
-  }
-
-  /**
-   * Find the repeating-children container that holds the messages.
+  /* ===================================================================================
+   * 7. MESSAGE DETECTION  ← the part that must be right
+   * ===================================================================================
+   *  Your page: transcript children = 1, 87 text nodes, only 2 rows guessed.
+   *  Instagram wraps every message in layer after layer of divs, so looking at
+   *  "children that look like a message" fails completely.
    *
-   * Instagram has removed role="row"/role="grid" from messages, so instead of
-   * trusting roles we look for the container whose CHILDREN each look like one
-   * message. That pattern survives class-name and role churn.
-   */
-  function findMessageRows(scroller) {
-    const root = scroller || document.body;
-    let best = null;
-    let bestScore = 0;
+   *  The reliable model is depth-based: bubble wrappers all live at the SAME
+   *  nesting depth inside the transcript, no matter how deep that is. So we take
+   *  the text content elements, climb to the transcript, and pick the depth that
+   *  yields many candidate blocks — each containing exactly one message.
+   * =================================================================================== */
 
-    const containers = [root, ...root.querySelectorAll('div, ul, section')];
-    for (const c of containers) {
-      if (c.children.length < 2 || c.children.length > 400) continue;
-      // never harvest the conversation rail — it is visually message-shaped
-      if (c.closest('nav, [role="list"][aria-label*="Chats" i], [aria-label*="Chats" i], [aria-label*="Inbox" i], [aria-label*="Conversations" i]')) continue;
-      if (c.querySelector('a[href*="/direct/t/"]')) continue;
-      let good = 0;
-      for (const child of c.children) {
-        if (looksLikeMessage(child)) good++;
-      }
-      if (good < 2) continue;
-      // require the children to be mostly messages (not a wrapper of wrappers)
-      const ratio = good / c.children.length;
-      if (ratio < 0.5) continue;
-      const score = good + ratio * 10;
-      if (score > bestScore) { bestScore = score; best = c; }
-    }
-
-    if (best) {
-      return Array.from(best.children).filter(looksLikeMessage);
-    }
-    return [];
-  }
-
-  /** Is this node inside the conversation list / sidebar rather than the chat? */
-  function inInbox(el, scroller) {
-    if (!el) return false;
-    if (scroller && scroller.contains(el)) return false;       // inside the chat → fine
-    if (el.querySelector('a[href*="/direct/t/"]')) return true; // links to another thread
-    if (el.closest('nav, [aria-label*="Conversation" i], [aria-label*="Chats" i], [aria-label*="Inbox" i]')) return true;
-    return false;
-  }
-
-  /** Instagram renders every message twice; the copy is hidden and must be skipped. */
-  function isHiddenRow(row) {
-    if (row.getAttribute('aria-hidden') === 'true') return true;
-    let el = row;
-    for (let i = 0; i < 4 && el && el !== document.body; i++, el = el.parentElement) {
-      const st = getComputedStyle(el);
-      if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity) === 0) return true;
-      const r = el.getBoundingClientRect();
-      if (r.height < 8 || r.width < 8) return true;
-    }
-    return false;
-  }
-
-  const MAX_BUBBLE_HEIGHT = 520;
-
+  const AVATAR_ALT = /(profile picture|profile photo|user avatar|^avatar$|\bavatar\b)/i;
+  const AVATAR_PATH = /\/(?:profile_pic|avatar|pfp)[\w.-]*/i;
+  // "M∂.รσα∂ replied to you" — the name can be in ANY script, so never try to
+  // enumerate characters. Match the banner shape instead, anchored at both ends.
+  const REPLY_QUOTE_RE = /^.{0,60}?\breplied to\b.{0,40}$/i;
+  const IG_CONTENT_RE = /instagram\.com\/(reel|reels|p|tv)\//i;
   const REACTION_ONLY = /^(?:\p{Extended_Pictographic}|\uFE0F|\u200D|\s)+$/u;
+  const REACTION_STRIP = /\p{Extended_Pictographic}[\uFE0F\u200D\p{Extended_Pictographic}]*/gu;
+  const NOISE_ALT = /^(shared photo|photo shared by|video shared by|image|photo|gif|sticker)/i;
+  const MAX_BUBBLE_HEIGHT = 600;
 
-  /** Does this element hold a message body? (Avoids reacting to its buttons.) */
-  function hasMessageContent(el) {
-    if (el.querySelector('[dir="auto"], video, audio')) return true;
-    // an avatar alone is not a message — only a real inline picture counts
-    if (Array.from(el.querySelectorAll('img')).some((im) => !isLikelyAvatarImg(im))) return true;
-    if (el.querySelector('a[href*="/reel/"], a[href*="/reels/"], a[href*="/p/"], a[href*="/tv/"]')) return true;
-    // attachment / document cards have text but often no [dir="auto"]
-    if (/\.(pdf|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|apk)\b/i.test(el.innerText || '')) return true;
+  function isLikelyAvatarImg(img) {
+    if (!img) return true;
+    const alt = img.getAttribute('alt') || '';
+    if (AVATAR_ALT.test(alt)) return true;
+    for (const attr of ['aria-label', 'title']) {
+      const v = img.getAttribute(attr);
+      if (v && AVATAR_ALT.test(v)) return true;
+    }
+    const src = img.getAttribute('src') || '';
+    if (AVATAR_PATH.test(src)) return true;
+    const r = img.getBoundingClientRect();
+    const rendered = Math.max(r.width, r.height);
+    if (rendered > 0 && rendered < 72) return true;
+    if (rendered === 0) return true;
+    const natW = img.naturalWidth || 0;
+    const natH = img.naturalHeight || 0;
+    if (natW && natW === natH && natW <= 160 && rendered <= 96) return true;
     return false;
   }
 
-
-  /**
-   * Walk UP from a content element to the outermost ancestor that is still a
-   * single message (does not contain other message bodies and does not span the
-   * whole conversation). Returns the element to treat as one message.
-   */
-  function climbToBubble(start, stopAt) {
-    let node = start;
-    let best = start;
-    for (let i = 0; i < 12; i++) {
-      const parent = node.parentElement;
-      if (!parent || parent === stopAt || parent === document.body) break;
-      // stop if the parent starts holding a second message
-      if (parent.querySelectorAll('[dir="auto"]').length > 1) break;
-      if (parent.querySelectorAll('img').length > 1 && !parent.querySelector('a[href*="/reel/"], a[href*="/p/"]')) break;
-      const r = parent.getBoundingClientRect();
-      if (r.height > MAX_BUBBLE_HEIGHT) break;                 // too big → a container
-      if (r.width > 0) best = parent;
-      // a real bubble has visible padding/background; once we have size, keep climbing
-      node = parent;
-    }
-    return best;
+  function fullText(node) {
+    return (node.innerText || node.textContent || '').trim();
   }
 
-  /** All message bubbles in the open conversation, top → bottom. */
   /**
-   * All messages of the open conversation, top → bottom.
-   *
-   * Uses findMessageRows() (repeating-children pattern) first, then falls back to
-   * climbing from content nodes. Hidden duplicate render nodes are filtered out.
+   * Does this word appear inside the chat's own UI labels (reply banners,
+   * reactions, "Replied to …") rather than in a message body?
    */
-  /**
-   * Instagram inserts date dividers ("October 25, 2026", "Yesterday 4:12 PM")
-   * as their own rows. Detect them by *shape*, never with `new Date(text)` —
-   * V8 happily parses "msg 0" as a 2001 date, which silently deleted every
-   * message starting with a short word + number.
-   */
+  function isUiLabel(text) {
+    const t = (text || '').trim();
+    if (!t) return true;
+    if (REPLY_QUOTE_RE.test(t)) return true;
+    if (/^replied to you$/i.test(t)) return true;
+    if (/^you replied to/i.test(t)) return true;
+    if (/^(seen|delivered|sent)$/i.test(t)) return true;
+    if (/^\d{1,2}:\d{2}\s?[AP]M$/i.test(t)) return true;
+    if (/^\d+[smhdwy]$/i.test(t)) return true;
+    if (/^active (now|\d)/i.test(t)) return true;
+    if (/^(liked a message|reacted to)/i.test(t)) return true;
+    return false;
+  }
+
   const MONTH = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*';
   const WEEKDAY = '(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*';
   const DATE_SEPARATOR = new RegExp(
@@ -1166,6 +899,7 @@
     '|^\\s*\\d{1,2}/\\d{1,2}/\\d{2,4}\\s*$',
     'i'
   );
+
   function isDateSeparator(txt) {
     if (!txt) return false;
     const clean = String(txt).replace(/\s+/g, ' ').trim();
@@ -1173,47 +907,235 @@
     return DATE_SEPARATOR.test(clean);
   }
 
-  function getBubbles() {
-    const scroller = findThreadScroller();
-    let bubbles = findMessageRows(scroller);
+  /** Depth of `node` below `root` (root itself = 0). */
+  function depthBelow(node, root) {
+    let d = 0;
+    let cur = node;
+    while (cur && cur !== root) { cur = cur.parentElement; d++; if (d > 60) return -1; }
+    return cur === root ? d : -1;
+  }
 
-    // ── fallback: climb from content nodes inside the scroller ────────────────
-    if (!bubbles.length) {
-      const root = scroller || document.querySelector('main') || document.body;
-      const seeds = Array.from(root.querySelectorAll(
-        '[dir="auto"], img, video, audio, [aria-label*="document" i], [aria-label*="file" i]'
-      )).filter((n) => {
-        if (n.closest('[role="dialog"]')) return false;
-        if (n.querySelector('a[href*="/direct/t/"]')) return false;
-        if (n.closest('a[href*="/direct/t/"]')) return false;
-        const r = n.getBoundingClientRect();
-        return r.width > 4 && r.height > 4;
-      });
-      bubbles = seeds.map((n) => climbToBubble(n, root));
-      bubbles = bubbles.filter((b, i, arr) => !arr.some((o) => o !== b && o.contains(b)));
-    }
-
-    // ── shared filtering ─────────────────────────────────────────────────────
-    bubbles = bubbles.filter((b) => {
-      if (isHiddenRow(b)) return false;
-      if (!hasMessageContent(b)) return false;
-      const txt = (b.innerText || '').trim();
-      if (txt && REACTION_ONLY.test(txt) && !b.querySelector('img, audio, video')) return false;
-      if (isDateSeparator(txt)) return false;
+  /** Real shared media inside an element (avatars excluded). */
+  function realImages(node) {
+    return Array.from(node.querySelectorAll('img')).filter((im) => {
+      if (!im.src) return false;
+      if (isLikelyAvatarImg(im)) return false;
+      if (im.closest('a[href*="/reel/"], a[href*="/reels/"], a[href*="/p/"], a[href*="/tv/"]')) return false;
       return true;
     });
+  }
 
-    // de-duplicate nested + visually identical nodes
+  function hasRealMedia(node) {
+    if (node.querySelector('audio, video')) return true;
+    if (realImages(node).length) return true;
+    if (node.querySelector('a[href*="/reel/"], a[href*="/reels/"], a[href*="/p/"], a[href*="/tv/"]')) return true;
+    if (/\.(pdf|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|apk)\b/i.test(fullText(node))) return true;
+    return false;
+  }
+
+  /** DOM order comparator for two elements. */
+  function domOrder(a, b) {
+    if (a === b) return 0;
+    const pos = a.compareDocumentPosition(b);
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  }
+
+  /** Sanity checks for one candidate message block. */
+  function blockLooksValid(node, root) {
+    if (!node || node === root || node.nodeType !== 1) return false;
+    if (node.closest('[role="dialog"]')) return false;
+    if (looksLikeRail(node)) return false;
+
+    const r = node.getBoundingClientRect();
+    if (r.height < 8 || r.width < 20) return false;
+    if (r.height > MAX_BUBBLE_HEIGHT) return false;
+
+    const txt = fullText(node);
+    if (isDateSeparator(txt)) return false;
+
+    // A message holds ONE body. More than a few [dir=auto] means we climbed too
+    // far and grabbed the list instead of a single message.
+    const textNodes = node.querySelectorAll('[dir="auto"]').length;
+    if (textNodes > 4) return false;
+
+    if (!txt && !hasRealMedia(node)) return false;
+    // a reply banner with no body and no media is chrome, not a message
+    if (txt && isUiLabel(txt) && !hasRealMedia(node)) return false;
+    return true;
+  }
+
+  /** Is this node part of the open conversation (not the rail, a dialog, or hidden)? */
+  function inChat(node, root) {
+    if (!root || !root.contains(node)) return false;
+    if (node.closest('[role="dialog"]')) return false;
+    if (looksLikeRail(node)) return false;
+    const r = node.getBoundingClientRect();
+    // Instagram keeps a hidden "measure" copy of every message: height 0 but
+    // FULL WIDTH, so testing width alone let them through and every message was
+    // saved twice.
+    if (r.height < 4 || r.width < 4) return false;
+    try {
+      const st = getComputedStyle(node);
+      if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity) === 0) return false;
+    } catch (_) {}
+    return true;
+  }
+
+  /** One "piece of content" that belongs to exactly one message. */
+  function contentSeeds(root) {
+    const seeds = [];
+    root.querySelectorAll('[dir="auto"]').forEach((n) => {
+      const t = (n.innerText || '').trim();
+      if (!t) return;
+      if (isUiLabel(t) || isDateSeparator(t)) return;
+      if (!inChat(n, root)) return;
+      seeds.push(n);
+    });
+    root.querySelectorAll('img, audio, video').forEach((n) => {
+      if (n.tagName === 'IMG' && isLikelyAvatarImg(n)) return;
+      // NOTE: a reel/post poster lives inside a link to the post — it IS the
+      // message preview, so it must be a seed. Excluding it made shared reels
+      // invisible and they were never saved.
+      if (!inChat(n, root)) return;
+      seeds.push(n);
+    });
+    return seeds;
+  }
+
+  /**
+   * Climb from one content node to the wrapper that holds exactly ONE message.
+   *
+   * We stop as soon as the parent holds two or more separate content groups —
+   * that parent is the message list, so the child is a single message. This is
+   * what keeps photos, reels and voice notes attached to their own message
+   * instead of being chopped off by a text-only depth heuristic.
+   */
+  function wrapperFor(seed, root) {
+    let cur = seed;
+    for (let i = 0; i < 14; i++) {
+      const parent = cur.parentElement;
+      if (!parent || parent === root || parent === document.body) return cur;
+      if (contentGroupsIn(parent, root) >= 2) return cur;
+      cur = parent;
+    }
+    return cur;
+  }
+
+  /** How many separate content pieces does this element directly hold? */
+  function contentGroupsIn(node, root) {
+    let groups = 0;
+    for (const child of node.children) {
+      if (child.querySelector('[dir="auto"]') ||
+          realImages(child).length ||
+          child.querySelector('audio, video') ||
+          (child.matches && child.matches('img') && !isLikelyAvatarImg(child))) {
+        groups++;
+      }
+      if (groups > 6) break;
+    }
+    return groups;
+  }
+
+  /**
+   * Candidate message blocks, top → bottom.
+   *
+   * Primary path: climb each content seed to its single-message wrapper.
+   * Fallback: the depth-histogram method (for layouts where every message is a
+   * direct child of a deep wrapper).
+   */
+  function findMessageBlocks(scroller) {
+    const root = scroller || document.body;
+    const seeds = contentSeeds(root);
+    if (!seeds.length) return [];
+
+    const blocks = [];
     const seen = new Set();
+    for (const seed of seeds) {
+      const w = wrapperFor(seed, root);
+      if (!w || seen.has(w)) continue;
+      seen.add(w);
+      if (!blockLooksValid(w, root)) continue;
+      blocks.push(w);
+    }
+
+    // keep the innermost of any nested pair
+    let out = blocks.filter((b, i, arr) => !arr.some((o) => o !== b && b.contains(o)));
+
+    if (out.length < 2) {
+      // fallback: deepest repeating depth
+      const depthHit = depthBasedBlocks(root, seeds);
+      if (depthHit.length > out.length) out = depthHit;
+    }
+
+    return out.sort(domOrder);
+  }
+
+  function depthBasedBlocks(root, seeds) {
+    const hist = new Map();
+    const byDepth = new Map();
+    for (const s of seeds) {
+      const d = depthBelow(s, root);
+      if (d < 2) continue;
+      hist.set(d, (hist.get(d) || 0) + 1);
+      if (!byDepth.has(d)) byDepth.set(d, []);
+      byDepth.get(d).push(s);
+    }
+    let best = [];
+    for (const d of Array.from(hist.keys()).sort((a, b) => b - a)) {
+      const blocks = [];
+      const seen = new Set();
+      for (const seed of byDepth.get(d) || []) {
+        const anc = ancestorAtDepth(seed, root, d);
+        if (!anc || seen.has(anc)) continue;
+        seen.add(anc);
+        if (!blockLooksValid(anc, root)) continue;
+        blocks.push(anc);
+      }
+      if (blocks.length > best.length) best = blocks;
+      if (blocks.length >= 6) break;
+    }
+    return best;
+  }
+
+  /** Every message currently rendered, top → bottom. */
+  function getBubbles() {
+    const scroller = findThreadScroller();
+    let bubbles = findMessageBlocks(scroller);
+
+    if (!bubbles.length) {
+      // structure-free fallback: text nodes grouped by their nearest ancestor
+      const root = scroller || document.body;
+      const seeds = Array.from(root.querySelectorAll('[dir="auto"]')).filter((n) => inChat(n, root));
+      const groups = [];
+      const seen = new Set();
+      for (const n of seeds) {
+        let g = n;
+        for (let i = 0; i < 4; i++) {
+          if (!g.parentElement || g.parentElement === root) break;
+          if (g.parentElement.querySelectorAll('[dir="auto"]').length > 1) break;
+          g = g.parentElement;
+        }
+        if (seen.has(g)) continue;
+        seen.add(g);
+        if (blockLooksValid(g, root)) groups.push(g);
+      }
+      bubbles = groups;
+    }
+
+    // de-duplicate nested blocks, keep the innermost
+    bubbles = bubbles.filter((b, i, arr) => !arr.some((o) => o !== b && b.contains(o)));
+
     const out = [];
+    const seen = new Set();
     for (const b of bubbles) {
       const r = b.getBoundingClientRect();
-      const key = Math.round(r.top) + '|' + Math.round(r.left) + '|' + (b.innerText || '').trim().slice(0, 60);
+      const key = Math.round(r.top) + '|' + Math.round(r.left) + '|' + fullText(b).slice(0, 60);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(b);
     }
-
     out.sort((a, b) => {
       const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
       return ra.top - rb.top || ra.left - rb.left;
@@ -1221,9 +1143,11 @@
     return { bubbles: out, scroller };
   }
 
-  const isLikelyAvatar = (img) => isLikelyAvatarImg(img);
+  /* ===================================================================================
+   * 8. EXTRACTION
+   * =================================================================================== */
 
-  /** "Me" = row rendered right-to-left (row-reverse wrapper), with a geometry fallback. */
+  /** "Me" = rendered right-to-left, with a geometry fallback. */
   function isMine(row) {
     let el = row;
     for (let i = 0; i < 9 && el && el !== document.body; i++, el = el.parentElement) {
@@ -1233,7 +1157,6 @@
         if (getComputedStyle(el).flexDirection === 'row-reverse') return true;
       } catch (_) { /* ignore */ }
     }
-    // geometry fallback: is the bubble sitting on the right half of the row?
     const marker = row.querySelector('[dir="auto"]') || row.querySelector('img') || row;
     const mr = marker.getBoundingClientRect();
     const rr = row.getBoundingClientRect();
@@ -1241,66 +1164,73 @@
     return (mr.left + mr.width / 2 - rr.left) / rr.width > 0.55;
   }
 
-  const REACTION_STRIP = /\p{Extended_Pictographic}[\uFE0F\u200D\p{Extended_Pictographic}]*/gu;
+  /**
+   * Text of one message, with every piece of chat chrome removed.
+   *
+   * This is where "M∂.รσα∂ replied to you" came from: Instagram renders the reply
+   * banner inside the same block as the message. Banners are recognised and
+   * dropped, and a banner that is the ONLY text means "this is a reply with no
+   * new text" → return '' so the block can be skipped instead of saved as junk.
+   */
+  function extractTextFor(row, excludeEls) {
+    const skip = new Set(excludeEls || []);
+    const parts = [];
+    const nodes = Array.from(row.querySelectorAll('[dir="auto"]'));
 
-  /** Reaction pill: tiny emoji-only element floating on the bubble corner. */
-  function findReaction(row, excludeEls) {
-    for (const el of row.querySelectorAll('[aria-label]')) {
-      const label = el.getAttribute('aria-label') || '';
+    for (const n of nodes) {
+      let blocked = false;
+      for (const s of skip) { if (s === n || s.contains(n)) { blocked = true; break; } }
+      if (blocked) continue;
+
+      const t = (n.innerText || '').trim();
+      if (!t) continue;
+      if (t.length > 4000) continue;
+
+      if (isUiLabel(t)) continue;            // reply banner, "seen", clock, "2h"
+      if (isDateSeparator(t)) continue;
+      if (NOISE_ALT.test(t)) continue;
+
+      // quoted reply payload: a nested block that repeats the quoted text
+      if (n.closest('blockquote')) continue;
+
+      if (parts[parts.length - 1] !== t) parts.push(t);
+    }
+
+    let text = parts.join('\n').trim();
+    // strip a trailing/leading banner that survived as one line among many
+    text = text.split('\n').filter((l) => !isUiLabel(l)).join('\n').trim();
+    return text;
+  }
+
+  function findReaction(row) {
+    // 1) labelled react buttons ("React with ❤️")
+    for (const e of row.querySelectorAll('[aria-label]')) {
+      const label = e.getAttribute('aria-label') || '';
       if (!/react/i.test(label)) continue;
-      const txt = (el.innerText || el.textContent || '').trim();
+      const txt = (e.innerText || e.textContent || '').trim();
       const emoji = txt.match(REACTION_STRIP);
       if (emoji && emoji.length) return emoji.join('');
       const byLabel = label.match(REACTION_STRIP);
       if (byLabel && byLabel.length) return byLabel.join('');
     }
-    for (const el of row.querySelectorAll('span, div')) {
-      if (el.children.length > 1) continue;
-      if (el.closest('[dir="auto"]')) continue;
-      const txt = (el.textContent || '').trim();
-      if (!txt || txt.length > 12) continue;
+    // 2) a tiny emoji-only element that is not the message body
+    const textNodes = new Set(Array.from(row.querySelectorAll('[dir="auto"]')));
+    for (const e of row.querySelectorAll('span, div')) {
+      if (e.children.length > 1) continue;
+      const txt = (e.textContent || '').trim();
+      if (!txt || txt.length > 14) continue;
       const emoji = txt.match(REACTION_STRIP);
       if (!emoji) continue;
-      const leftovers = txt.replace(REACTION_STRIP, '').replace(/[\s0-9+]/g, '');
-      if (leftovers.length) continue;
-      const r = el.getBoundingClientRect();
+      if (!REACTION_ONLY.test(txt.replace(/[\d+]/g, ''))) continue;
+      let isText = false;
+      for (const tn of textNodes) { if (tn === e || tn.contains(e)) { isText = true; break; } }
+      if (isText) continue;
+      const r = e.getBoundingClientRect();
       if (r.width === 0) continue;
-      if (r.width <= 60 && r.height <= 40) return emoji.slice(0, 3).join('');
+      if (r.width <= 64 && r.height <= 44) return emoji.slice(0, 3).join('');
     }
     return null;
   }
-
-  function extractText(row, reactionEl) {
-    const parts = [];
-    const nodes = row.querySelectorAll('[dir="auto"]');
-    if (nodes.length) {
-      nodes.forEach((n) => {
-        if (reactionEl && (n === reactionEl || reactionEl.contains(n) || n.contains(reactionEl))) return;
-        const t = (n.innerText || '').trim();
-        if (t) parts.push(t);
-      });
-    }
-    if (!parts.length) {
-      const clone = row.cloneNode(true);
-      clone.querySelectorAll('svg, script, style, audio, video, img').forEach((n) => n.remove());
-      const t = (clone.innerText || '').trim();
-      if (t) parts.push(t);
-    }
-    const out = [];
-    parts.forEach((p) => {
-      if (NOISE_ALT.test(p)) return;                       // alt text, not a message
-      if (/^\d+[smhd]$/.test(p)) return;                   // "55m" timestamp
-      if (/^\d{1,2}:\d{2}(\s?[AP]M)?$/i.test(p)) return;    // "8:04 PM"
-      if (out[out.length - 1] !== p) out.push(p);
-    });
-    return out.join('\n').trim();
-  }
-
-  // Instagram labels photos with alt="Shared photo" / "Photo shared by …" — that is
-  // not user text, so it must never become a caption.
-  const NOISE_ALT = /^(shared photo|photo shared by|video shared by|image|photo|gif|sticker)/i;
-
-  const IG_CONTENT_RE = /instagram\.com\/(reel|reels|p|tv)\//i;
 
   function extractReels(row) {
     const links = new Map();
@@ -1311,14 +1241,12 @@
       links.set(href.split('?')[0], img ? img.src : null);
     });
     if (!links.size) {
-      const t = row.innerText || '';
-      const m = t.match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|reels|p|tv)\/[^\s]+/i);
+      const m = fullText(row).match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|reels|p|tv)\/[^\s]+/i);
       if (m) links.set(m[0].split('?')[0], null);
     }
     return Array.from(links.entries()).map(([url, thumb]) => ({ url, thumb }));
   }
 
-  /** Cheap, re-render-stable identity for an image (CDN query strings rotate, path doesn't). */
   function imageFingerprint(src) {
     try {
       const u = new URL(src);
@@ -1329,36 +1257,14 @@
     }
   }
 
-  /** Rows that are pure chrome (timestamps, "Sent an attachment") are not messages. */
-  function isJunkItem(item) {
-    if (item.kind !== 'text') return false;
-    const t = (item.text || '').trim();
-    if (!t) return true;
-    if (/^\d{1,2}:\d{2}(\s?[AP]M)?$/i.test(t)) return true;      // clock only
-    if (/^(today|yesterday|mon|tue|wed|thu|fri|sat|sun)/i.test(t) && t.length < 12) return true;
-    if (/sent an attachment\.?$/i.test(t) && t.length < 40) return true;
-    return false;
-  }
-
-  /**
-   * Attachment / document cards (PDF, docs, zips). These are easy to miss because
-   * Instagram renders them as a small card, sometimes without any [dir="auto"].
-   */
   function extractAttachment(row) {
-    const txt = (row.innerText || row.textContent || '').trim();
+    const txt = fullText(row);
     const sizeRe = /\b\d+(\.\d+)?\s?(B|KB|MB|GB)\b/i;
     const extRe = /\.(pdf|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|apk|mp3|mp4|mov|heic|jpg|png)\b/i;
-
     const size = (txt.match(sizeRe) || [''])[0];
     const hasExt = extRe.test(txt);
-
-    // a "file card" look: a small document icon / attachment container
-    const cardLike = !!row.querySelector(
-      '[aria-label*="document" i], [aria-label*="file" i], [aria-label*="attachment" i]'
-    );
-
+    const cardLike = !!row.querySelector('[aria-label*="document" i], [aria-label*="file" i], [aria-label*="attachment" i]');
     if (!hasExt && !(cardLike && size)) return null;
-
     const lines = txt.split('\n').map((t) => t.trim()).filter(Boolean);
     let name = lines.find((l) => extRe.test(l));
     if (!name) name = lines[0] || (cardLike ? 'Attachment' : '');
@@ -1366,120 +1272,12 @@
     return { name: name.slice(0, 120), size };
   }
 
-  /** Reaction emoji attached to a bubble. */
-  function findReaction(row) {
-    // 1) labelled react buttons
-    for (const el of row.querySelectorAll('[aria-label]')) {
-      const label = el.getAttribute('aria-label') || '';
-      if (!/react/i.test(label)) continue;
-      const txt = (el.innerText || el.textContent || '').trim();
-      const emoji = txt.match(REACTION_STRIP);
-      if (emoji && emoji.length) return emoji.join('');
-      const byLabel = label.match(REACTION_STRIP);
-      if (byLabel && byLabel.length) return byLabel.join('');
-    }
-    // 2) an emoji-only element that is NOT the message text
-    const textNodes = new Set(Array.from(row.querySelectorAll('[dir="auto"]')));
-    for (const el of row.querySelectorAll('span, div')) {
-      if (el.children.length > 1) continue;
-      const txt = (el.textContent || '').trim();
-      if (!txt || txt.length > 14) continue;
-      const emoji = txt.match(REACTION_STRIP);
-      if (!emoji) continue;
-      // only pure emoji, optionally with a count like "2"
-      if (!REACTION_ONLY.test(txt.replace(/[\d+]/g, ''))) continue;
-      // it must not be the bubble's own text
-      let isText = false;
-      for (const tn of textNodes) { if (tn === el || tn.contains(el)) { isText = true; break; } }
-      if (isText) continue;
-      const r = el.getBoundingClientRect();
-      if (r.width === 0) continue;
-      if (r.width <= 64 && r.height <= 44) return emoji.slice(0, 3).join('');
-    }
-    return null;
-  }
-
-  function extractTextFrom(row) {
-    const parts = [];
-    Array.from(row.querySelectorAll('[dir="auto"]')).forEach((n) => {
-      const t = (n.innerText || '').trim();
-      if (!t) return;
-      if (NOISE_ALT.test(t)) return;
-      if (/^\d{1,2}:\d{2}(\s?[AP]M)?$/i.test(t)) return;
-      if (/^\d+[smhd]$/.test(t)) return;
-      if (/^replied to you$/i.test(t)) return;
-      if (parts[parts.length - 1] !== t) parts.push(t);
-    });
-    return parts.join('\n').trim();
-  }
-
-  function extractReelsFrom(row) {
-    const links = new Map();
-    row.querySelectorAll('a[href]').forEach((a) => {
-      const href = a.href || '';
-      if (!IG_CONTENT_RE.test(href)) return;
-      const img = a.querySelector('img');
-      links.set(href.split('?')[0], img ? img.src : null);
-    });
-    if (!links.size) {
-      const t = row.innerText || '';
-      const m = t.match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|reels|p|tv)\/[^\s]+/i);
-      if (m) links.set(m[0].split('?')[0], null);
-    }
-    return Array.from(links.entries()).map(([url, thumb]) => ({ url, thumb }));
-  }
-
-  /**
-   * Is this image somebody's profile picture rather than a shared photo?
-   *
-   * Critical detail: Instagram renders an in-thread avatar at 24×24 but the file
-   * it points at is a 150×150 scontent thumbnail. Testing `naturalWidth` — as an
-   * earlier version did via Math.max() — therefore treated EVERY avatar as a real
-   * photo, and the relay inlined the same profile picture over and over, turning
-   * text messages into "photos".
-   *
-   * So: judge by what is on screen, plus explicit avatar markers.
-   */
-  const AVATAR_ALT = /(profile picture|profile photo|user avatar|^avatar$|\bavatar\b)/i;
-  const AVATAR_PATH = /\/(?:profile_pic|avatar|pfp)[\w.-]*/i;
-
-  const isLikelyAvatarImg = (img) => {
-    if (!img) return true;
-    // 1. Instagram literally labels them
-    const alt = img.getAttribute('alt') || '';
-    if (AVATAR_ALT.test(alt)) return true;
-    for (const attr of ['aria-label', 'title']) {
-      const v = img.getAttribute(attr);
-      if (v && AVATAR_ALT.test(v)) return true;
-    }
-    // 2. explicit avatar URL shapes (avatars are CDN thumbs, never /p/ media)
-    const src = img.getAttribute('src') || '';
-    if (AVATAR_PATH.test(src)) return true;
-    // 3. size as rendered on screen — NOT naturalWidth
-    const r = img.getBoundingClientRect();
-    const rendered = Math.max(r.width, r.height);
-    if (rendered > 0 && rendered < 72) return true;
-    if (rendered === 0) return true;                 // not visible at all
-    // 4. square, tiny natural file in a narrow wrapper
-    const natW = img.naturalWidth || 0;
-    const natH = img.naturalHeight || 0;
-    if (natW && natW === natH && natW <= 160 && rendered <= 96) return true;
-    // 5. a picture sitting inside an avatar-ring wrapper
-    if (img.closest('[class*="avatar" i], [aria-label*="avatar" i], [alt*="avatar" i]')) return true;
-    return false;
-  };
-
-  /** Extract one bubble into a normalised message record. */
+  /** One bubble → a normalised record. */
   function extractRow(row) {
     const side = isMine(row) ? 'me' : 'friend';
-    const reaction = findReaction(row);
-    const text = extractTextFrom(row);
 
-    const imgs = Array.from(row.querySelectorAll('img')).filter(
-      (img) => img.src && !isLikelyAvatarImg(img) &&
-        !img.closest('a[href*="/reel/"], a[href*="/reels/"], a[href*="/p/"], a[href*="/tv/"]')
-    );
-    const reels = extractReelsFrom(row);
+    const imgs = realImages(row);
+    const reels = extractReels(row);
     const audio = row.querySelector('audio');
     const audioSrc = audio ? (audio.currentSrc || audio.src || null) : null;
     const video = row.querySelector('video');
@@ -1492,13 +1290,12 @@
     else if (imgs.length) kind = 'photo';
     else if (file) kind = 'file';
 
-    // A caption is real text that is NOT the file name / placeholder alt text.
-    let caption = text;
-    if (kind === 'file' && file && text.includes(file.name)) caption = '';
-    if (NOISE_ALT.test(text || '')) caption = '';
+    let caption = extractTextFor(row, []);
+    if (kind === 'file' && file && caption.includes(file.name)) caption = '';
+    if (NOISE_ALT.test(caption || '')) caption = '';
 
     const imgSrc = kind === 'photo' ? imgs[0].src : null;
-    const reelThumbSrc = kind === 'reel' ? (reels[0].thumb || imgs[0]?.src || null) : null;
+    const reelThumbSrc = kind === 'reel' ? (reels[0].thumb || (imgs[0] && imgs[0].src) || null) : null;
 
     const sig = hash([
       side,
@@ -1512,71 +1309,30 @@
     ].join('|'));
 
     return {
-      row, side, kind, text: caption || '', sig, reaction,
-      imgSrc, audioSrc, videoSrc: video ? (video.currentSrc || video.src || null) : null,
+      row, side, kind, text: caption || '', sig,
+      reaction: findReaction(row),
+      imgSrc, audioSrc,
+      videoSrc: video ? (video.currentSrc || video.src || null) : null,
       reel: reels[0] ? reels[0].url : null,
       reelThumbSrc,
       file,
     };
   }
 
-  /* ===================================================================================
-   * 6. SEQUENCE ALIGNMENT (catch-up without duplicates)
-   * =================================================================================== */
-
-  function ranksOf(sigs) {
-    const seen = new Map();
-    return sigs.map((sig) => {
-      const r = seen.get(sig) || 0;
-      seen.set(sig, r + 1);
-      return r;
-    });
-  }
-
-  function align(domSigs, tail) {
-    const n = domSigs.length;
-    const m = tail.length;
-
-    if (!m) return { start: 0, k: 0, behind: false };
-    if (!n) return { start: 0, k: 0, behind: false };
-
-    const maxK = Math.min(n, m, 60);
-    const domRank = ranksOf(domSigs);
-    const tailRank = ranksOf(tail.map((x) => x.sig));
-    for (let k = maxK; k >= 1; k--) {
-      for (let i = n - k; i >= 0; i--) {
-        let ok = true;
-        for (let j = 0; j < k; j++) {
-          const t = m - k + j;
-          if (domSigs[i + j] !== tail[t].sig) { ok = false; break; }
-          if (domRank[i + j] !== tailRank[t]) { ok = false; break; }
-        }
-        if (ok) return { start: i, k, behind: false };
-      }
-    }
-
-    const lastSig = tail[m - 1].sig;
-    for (let i = n - 1; i >= 0; i--) {
-      if (domSigs[i] === lastSig) return { start: i, k: 1, behind: false };
-    }
-
-    return { start: 0, k: 0, behind: true };
+  /** Chrome that must never be saved as a message. */
+  function isJunkItem(item) {
+    const t = (item.text || '').trim();
+    if (item.kind !== 'text') return false;
+    if (!t) return true;
+    if (isUiLabel(t)) return true;
+    if (isDateSeparator(t)) return true;
+    if (/sent an attachment\.?$/i.test(t) && t.length < 40) return true;
+    return false;
   }
 
   /* ===================================================================================
-   * 7. FIREBASE SYNC
+   * 9. PAYLOAD
    * =================================================================================== */
-
-  async function loadTail() {
-    const q = '?orderBy=' + encodeURIComponent('"$key"') + '&limitToLast=' + CONFIG.HISTORY_LOOKBACK;
-    const data = await fbRequest('GET', '.json' + q);
-    const entries = data && typeof data === 'object' ? Object.entries(data) : [];
-    entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-    STATE.tail = entries.map(([key, v]) => ({ key, sig: (v && v.sig) || '' }));
-    STATE.reactions.clear();
-    entries.forEach(([key, v]) => STATE.reactions.set(key, v && v.reactions ? v.reactions : null));
-    LOG('firebase tail loaded:', STATE.tail.length);
-  }
 
   function buildPayload(item, media) {
     const payload = {
@@ -1587,6 +1343,11 @@
       sig: item.sig,
       author: item.side === 'me' ? 'Orin' : 'MD.Soad',
     };
+    // True chat position, only when we actually know it. The viewer sorts on it,
+    // so writing a guess would be worse than writing nothing.
+    if (STATE.posMode === 'forward' && STATE.posSeq.has(item.sig)) {
+      payload.seq = STATE.posSeq.get(item.sig);
+    }
     if (item.caption) payload.caption = item.caption;
 
     if (item.kind === 'photo') {
@@ -1605,8 +1366,6 @@
     }
     if (item.kind === 'reel') {
       payload.reel = item.reel;
-      // the poster is small, so always try to inline it — even if the full
-      // thumbnail fetch failed we keep the CDN URL as a second chance
       if (media.thumb) payload.reelThumb = media.thumb;
       else if (item.reelThumbSrc) payload.reelThumbUrl = item.reelThumbSrc;
       if (item.text) payload.caption = item.text;
@@ -1623,24 +1382,43 @@
     return payload;
   }
 
+  /**
+   * Fetch and compress the media for one message. `failed` is true when the
+   * message carries media we could not obtain — the caller then saves an honest
+   * placeholder instead of inventing an empty bubble.
+   */
   async function prepareMedia(item) {
-    const media = { img: null, audio: null, thumb: null, videoThumb: null };
-    const safe = async (fn, label) => {
-      try { return await fn(); } catch (e) { WARN(label + ' failed', e.message); return null; }
+    const media = { img: null, audio: null, thumb: null, videoThumb: null, failed: false };
+    const attempt = async (fn, label) => {
+      for (let i = 1; i <= CONFIG.MAX_ATTEMPTS; i++) {
+        try {
+          const out = await fn();
+          if (out) return out;
+        } catch (e) {
+          VLOG(label + ' attempt ' + i + ' failed:', e.message);
+        }
+        await sleep(250 * i);
+      }
+      WARN(label + ' failed after ' + CONFIG.MAX_ATTEMPTS + ' attempts');
+      return null;
     };
 
     if (item.kind === 'photo' && item.imgSrc) {
-      media.img = await safe(() => mediaDataUrl(item.imgSrc), 'photo');
+      media.img = await attempt(() => mediaDataUrl(item.imgSrc), 'photo');
+      if (!media.img) media.failed = true;
     }
-    if (item.kind === 'reel' && item.reelThumbSrc) {
-      media.thumb = await safe(() => mediaDataUrl(item.reelThumbSrc, { maxPx: 480, quality: 0.62 }), 'reel thumb');
+    if (item.kind === 'reel') {
+      if (item.reelThumbSrc) {
+        media.thumb = await attempt(
+          () => mediaDataUrl(item.reelThumbSrc, { maxPx: 480, quality: 0.62 }), 'reel thumb');
+      }
+      if (!item.reel) media.failed = true;
     }
-    if (item.kind === 'video' && item.videoSrc) {
-      const v = await safe(() => makeVideoThumb(item.videoSrc), 'video thumb');
-      media.videoThumb = v;
+    if (item.kind === 'video' && item.videoSrc && !item.videoSrc.startsWith('blob:')) {
+      media.videoThumb = await attempt(() => makeVideoThumb(item.videoSrc), 'video thumb');
     }
     if (item.kind === 'voice' && item.audioSrc) {
-      const raw = await safe(() => getBytes(item.audioSrc), 'voice');
+      const raw = await attempt(() => getBytes(item.audioSrc), 'voice');
       if (raw && raw.buf && raw.buf.byteLength) {
         if (raw.buf.byteLength <= CONFIG.MAX_AUDIO_BYTES) {
           media.audio = 'data:' + (raw.mime || 'audio/mp4') + ';base64,' + abToBase64(raw.buf);
@@ -1648,20 +1426,16 @@
           WARN('voice note too large, keeping URL only');
         }
       }
+      if (!media.audio && (!item.audioSrc || item.audioSrc.startsWith('blob:'))) media.failed = true;
     }
     return media;
   }
 
-  /** Grab one frame from a video element and compress it. */
   async function makeVideoThumb(src) {
-    if (!src || src.startsWith('blob:')) {
-      // a blob video is already on the page; use its poster frame via the element
-      const v = document.querySelector('video');
-      if (!v) return null;
+    const v = document.querySelector('video');
+    if (v && v.videoWidth) {
       const c = document.createElement('canvas');
-      const w = v.videoWidth || v.clientWidth;
-      const h = v.videoHeight || v.clientHeight;
-      if (!w || !h) return null;
+      const w = v.videoWidth, h = v.videoHeight;
       c.width = Math.min(480, w);
       c.height = Math.round((c.width / w) * h);
       c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
@@ -1672,862 +1446,352 @@
     return toCompressedDataUrl(bytes.buf, bytes.mime, 480, 0.6);
   }
 
-  async function pushItem(item) {
-    const media = await prepareMedia(item);
-    const payload = buildPayload(item, media);
-    const res = await fbRequest('POST', '.json', payload);
-    const key = res && res.name;
-    if (!key) throw new Error('no key returned');
-    STATE.tail.push({ key, sig: item.sig });
-    if (STATE.tail.length > CONFIG.HISTORY_LOOKBACK * 2) STATE.tail.splice(0, STATE.tail.length - CONFIG.HISTORY_LOOKBACK);
-    if (item.reaction) STATE.reactions.set(key, item.reaction);
-    STATE.wrote++;
-    return key;
-  }
-
-  async function patchReactions(key, value) {
-    await fbRequest('PATCH', '/' + key + '.json', { reactions: value || null });
-  }
-
   /* ===================================================================================
-   * 7b. FULL-HISTORY BACKFILL
-   *     Instagram only renders a window of messages. To capture the WHOLE chat we
-   *     drive the conversation scroller up to the first message, collecting every
-   *     row on the way, then return to the bottom. Everything is then pushed in
-   *     true chat order.
+   * 10. THE SAVE LOOP
+   * ===================================================================================
+   *  Save everything on screen that is not in the database yet, top → bottom.
+   *  Two guards stop duplicates:
+   *    • the database index (sigCounts) — global truth
+   *    • seenThisSession — sigs pushed before the index could reflect them
    * =================================================================================== */
 
-  const sleepScroll = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  // Backfill trace — readable from the page via window.__relayTrace
-  const TRACE = [];
-  function trace(...a) {
-    const line = a.join(' ');
-    TRACE.push(line);
-    if (TRACE.length > 200) TRACE.shift();
-    VLOG('trace:', line);
-  }
-  try { window.__relayTrace = TRACE; } catch (_) {}
-
-  function scrollerBounds(el) {
-    return { top: el.scrollTop, max: Math.max(0, el.scrollHeight - el.clientHeight) };
-  }
-
   /**
-   * Harvest the bubbles currently on screen.
-   *
-   * Returns only the rows we have not seen before, in top→bottom DOM order.
-   * Because we always scroll UP, anything newly revealed sits above everything
-   * collected so far — so the caller can prepend it and keep true chat order.
+   * Give every message in this batch a `seq` (its place in the chat).
+   * First batch of a session anchors at 0..n-1; older batches go negative.
    */
-  function harvestNew(seen, scroller) {
-    const { bubbles } = getBubbles();
-    const base = scroller ? scroller.getBoundingClientRect().top : 0;
-    const fresh = [];
-    for (const b of bubbles) {
-      let item;
-      try { item = extractRow(b); } catch (_) { continue; }
-      if (isJunkItem(item)) continue;
-      if (!item.text && item.kind === 'text') continue;
-
-      // STABLE identity: content signature + the row's position *within the scroll
-      // content* (not the viewport — which moves every step and caused duplicates).
-      const rect = b.getBoundingClientRect();
-      const contentY = Math.round(rect.top - base + (scroller ? scroller.scrollTop : 0));
-      const key = item.sig + '@' + contentY;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      item.contentY = contentY;
-      fresh.push(item);
-    }
-
-    // Learn how many legitimately-identical messages exist ("ok" sent twice) by
-    // counting copies within a single render pass, and keep the maximum seen.
-    const passCount = new Map();
-    for (const item of fresh) passCount.set(item.sig, (passCount.get(item.sig) || 0) + 1);
-    for (const [sig, n] of passCount) {
-      if (n > (seen.maxPerSig?.get(sig) || 0)) {
-        if (!seen.maxPerSig) seen.maxPerSig = new Map();
-        seen.maxPerSig.set(sig, n);
+  function assignPositions(todo) {
+    if (!STATE.orderDecided) {
+      STATE.orderDecided = true;
+      let n = 0;
+      for (const it of todo) {
+        if (!STATE.posSeq.has(it.sig)) STATE.posSeq.set(it.sig, n++);
       }
-    }
-    return fresh;
-  }
-
-  /**
-   * Poke Instagram's "load older messages" hook.
-   *
-   * Simply sitting at scrollTop 0 often does not trigger it, so we oscillate a
-   * little and repeat. This is what makes the history walk reliable.
-   */
-  /**
-   * Fire every signal a lazy-loader might listen for at the top edge: real
-   * scrollTop movement, a synthetic `scroll` event (needed when the box is not
-   * overflowing, so scrollTop cannot change), and a wheel event. Returns true
-   * if the rendered message count or scrollHeight grew.
-   */
-  async function coaxMore(scroller, tries) {
-    const before = snapshotOf(scroller);
-    for (let i = 0; i < (tries || 3); i++) {
-      try { scroller.scrollTop = 0; } catch (_) {}
-      try { scroller.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
-      try {
-        const r = scroller.getBoundingClientRect();
-        scroller.dispatchEvent(new WheelEvent('wheel', {
-          bubbles: true, cancelable: true, deltaY: -600, deltaMode: 0,
-          clientX: Math.round(r.left + r.width / 2), clientY: Math.round(r.top + 40),
-        }));
-      } catch (_) {}
-      await sleepScroll(650);
-      if (snapshotOf(scroller) !== before) return true;
-    }
-    return false;
-  }
-
-  function snapshotOf(el) {
-    return el.scrollHeight + ':' + el.querySelectorAll('[dir="auto"]').length;
-  }
-
-  async function nudgeForMore(scroller) {
-    const before = scroller.scrollHeight + ':' + countMessageish(scroller);
-    for (let i = 1; i <= 2; i++) {
-      scroller.scrollTop = Math.round(60 * i);       // move down a bit
-      await sleepScroll(120);
-      scroller.scrollTop = 0;                        // slam back to the top
-      fireScrollHints(scroller, -1);
-      await sleepScroll(320);
-      // stop as soon as the loader answered — no point burning two more rounds
-      if (scroller.scrollHeight + ':' + countMessageish(scroller) !== before) return true;
-    }
-    return false;
-  }
-
-  /**
-   * ─────────────────────────────────────────────────────────────────────────────
-   * JUMP TO THE FIRST MESSAGE
-   * ─────────────────────────────────────────────────────────────────────────────
-   * Instagram never exposes "message #1" — you have to keep scrolling up until
-   * the transcript stops growing. This does exactly that, with every signal a
-   * lazy loader might listen for, and reports progress the whole way.
-   *
-   * Returns { ok, reachedTop, msgs, grew }.
-   */
-  async function jumpToFirstMessage(onProgress) {
-    const scroller = findThreadScroller();
-    if (!scroller) return { ok: false, reason: 'no conversation panel found' };
-
-    const startedAt = nowMs();
-    let stalls = 0;
-    let rounds = 0;
-    const seenCounts = [];
-
-    while (nowMs() - startedAt < CONFIG.MAX_BACKFILL_MS) {
-      if (document.hidden) return { ok: false, reason: 'tab went to the background' };
-
-      const beforeH = scroller.scrollHeight;
-      const beforeTop = scroller.scrollTop;
-      const beforeCount = countMessageish(scroller);
-
-      // 1. go to the very top the way a finger would
-      scroller.scrollTop = 0;
-      fireScrollHints(scroller);
-      await sleepScroll(CONFIG.SCROLL_SETTLE_MS);
-
-      // 2. still at the top? then ask the loader for another page
-      if (scroller.scrollHeight <= beforeH + 2 && scroller.scrollTop <= beforeTop + 2) {
-        fireScrollHints(scroller, -1);          // wheel up = "older messages"
-        scroller.scrollTop = Math.min(80, scroller.scrollHeight);
-        await sleepScroll(140);
-        scroller.scrollTop = 0;
-        fireScrollHints(scroller);
-        await sleepScroll(CONFIG.SCROLL_SETTLE_MS);
-      }
-
-      rounds++;
-      const grew = scroller.scrollHeight > beforeH + 2 || countMessageish(scroller) > beforeCount;
-      const count = countMessageish(scroller);
-      seenCounts.push(count);
-      if (onProgress) onProgress(count, rounds, grew);
-
-      if (grew) { stalls = 0; continue; }
-
-      // 3. nothing new. Tolerate a few slow loads before believing we are done.
-      stalls++;
-      if (stalls >= CONFIG.SCROLL_TOP_GRACE) {
-        return {
-          ok: true,
-          reachedTop: scroller.scrollTop <= 4,
-          msgs: count,
-          grew: count > (seenCounts[0] || 0),
-          rounds,
-        };
-      }
-      await sleepScroll(260);
-    }
-
-    return { ok: false, reason: 'timed out', msgs: countMessageish(scroller) };
-  }
-
-  /** How many message-shaped things are rendered right now (cheap, stable). */
-  function countMessageish(root) {
-    try {
-      const r = root || findThreadScroller() || document.body;
-      return r.querySelectorAll('[dir="auto"], img, video, audio').length;
-    } catch (_) { return 0; }
-  }
-
-  /**
-   * Fire the events a virtualised/lazy transcript listens for. Doing only
-   * `scrollTop = 0` is not enough: when the content already fits, nothing moves
-   * and no event is emitted, so the loader never hears us.
-   */
-  function fireScrollHints(scroller, direction) {
-    const dir = direction === undefined ? -1 : direction;
-    try { scroller.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
-    try {
-      const r = scroller.getBoundingClientRect();
-      scroller.dispatchEvent(new WheelEvent('wheel', {
-        bubbles: true, cancelable: true,
-        deltaY: dir * 900, deltaMode: 0,
-        clientX: Math.round(r.left + r.width / 2),
-        clientY: Math.round(r.top + r.height / 2),
-      }));
-    } catch (_) {}
-    try {
-      scroller.dispatchEvent(new TouchEvent('touchstart', { bubbles: true }));
-      scroller.dispatchEvent(new TouchEvent('touchmove', { bubbles: true }));
-      scroller.dispatchEvent(new TouchEvent('touchend', { bubbles: true }));
-    } catch (_) {}
-  }
-
-  /** Everything currently rendered, in top→bottom order (no scrolling needed). */
-  function harvestRendered() {
-    let { bubbles } = getBubbles();        // already sorted top → bottom
-    if (!bubbles.length) bubbles = discoverByStructure();
-    const out = [];
-    for (const b of bubbles) {
-      let item;
-      try { item = extractRow(b); } catch (_) { continue; }
-      if (isJunkItem(item)) continue;
-      if (!item.text && item.kind === 'text') continue;
-      out.push(item);
-    }
-    return dedupeSequential(out);
-  }
-
-  /**
-   * Absolute last resort — used when no composer and no recognisable container
-   * exist (unusual Instagram builds). Groups message text nodes by their nearest
-   * message-sized ancestor and sorts them top→bottom.
-   */
-  function discoverByStructure() {
-    const nodes = Array.from(document.querySelectorAll('[dir="auto"]')).filter((n) => {
-      if (!(n.innerText || '').trim()) return false;
-      if (n.closest('[role="dialog"]')) return false;
-      if (n.querySelector('a[href*="/direct/t/"]')) return false;
-      if (n.closest('a[href*="/direct/t/"]')) return false;
-      const r = n.getBoundingClientRect();
-      return r.width > 4 && r.height > 4;
-    });
-
-    const groups = [];
-    const seen = new Set();
-    for (const n of nodes) {
-      let g = n;
-      for (let i = 0; i < 5; i++) {
-        const p = g.parentElement;
-        if (!p || p === document.body) break;
-        if (p.querySelectorAll('[dir="auto"]').length > 1) break;
-        const r = p.getBoundingClientRect();
-        if (r.height > MAX_BUBBLE_HEIGHT) break;
-        g = p;
-      }
-      if (seen.has(g)) continue;
-      seen.add(g);
-      if (!hasMessageContent(g)) continue;
-      groups.push(g);
-    }
-
-    groups.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-    return groups;
-  }
-
-  async function backfillAll(onProgress) {
-    const started = nowMs();
-    const scroller = findThreadScroller();
-    if (!scroller) {
-      WARN('backfill: no scroller found — reading visible messages');
-      return harvestRendered();
-    }
-
-    // self-check: the computed scroller may be a non-scrolling wrapper; if so,
-    // hunt again for any genuinely scrollable container that holds messages
-    let useScroller = scroller;
-    if (useScroller.scrollHeight <= useScroller.clientHeight + 12) {
-      const composer = findComposer();
-      let found = null;
-      document.querySelectorAll('div, section, main, ul').forEach((el) => {
-        try {
-          const st = getComputedStyle(el);
-          if (!/(auto|scroll)/.test(st.overflowY)) return;
-          if (el.scrollHeight <= el.clientHeight + 12) return;
-          if (!el.querySelector('[dir="auto"]')) return;
-          if (composer && el.contains(composer)) return;
-          if (!found || (el.scrollHeight - el.clientHeight) > (found.scrollHeight - found.clientHeight)) found = el;
-        } catch (_) {}
-      });
-      if (found) {
-        WARN('backfill: wrapper does not scroll — using the real list container');
-        useScroller = found;
-      }
-    }
-
-    // Even when nothing overflows yet, Instagram loads older messages on a
-    // scroll/wheel signal at the top edge. Coax it before giving up, otherwise
-    // an idle thread is mistaken for "this is the whole conversation".
-    if (useScroller.scrollHeight <= useScroller.clientHeight + 12) {
-      WARN('backfill: transcript fits the screen — coaxing the loader');
-      const grew = await coaxMore(useScroller, 4);
-      if (!grew) {
-        WARN('backfill: no more history — reading visible messages');
-        return harvestRendered();
-      }
-    }
-
-    const seen = new Set();
-    const maxPerSig = new Map();  // how many identical messages legitimately exist
-    let collected = [];          // ascending chat order, built by prepending
-    const origTop = useScroller.scrollTop;
-
-    // start at the newest message
-    useScroller.scrollTop = useScroller.scrollHeight;
-    await sleepScroll(CONFIG.SCROLL_SETTLE_MS);
-    collected = harvestNew(seen, useScroller);          // bottom block (newest)
-
-    trace('scroller', useScroller.className || useScroller.id || 'div',
-          'h=' + useScroller.scrollHeight, 'ch=' + useScroller.clientHeight,
-          'top=' + Math.round(useScroller.scrollTop));
-    let idleAtTop = 0;
-    let lastHeight = useScroller.scrollHeight;
-    let steps = 0;
-    let stallNoMove = 0;
-
-    while (nowMs() - started < CONFIG.MAX_BACKFILL_MS) {
-      if (document.hidden) { WARN('backfill paused: tab hidden'); break; }
-      if (window.__relayWatchdog && window.__relayWatchdog.check()) {
-        WARN('backfill watchdog: read made no progress');
-        break;
-      }
-
-      const before = useScroller.scrollTop;
-      const step = Math.max(140, Math.floor(useScroller.clientHeight * CONFIG.SCROLL_STEP_RATIO));
-
-      // move up; clamp to 0 so we always reach the very top
-      useScroller.scrollTop = Math.max(0, before - step);
-      await sleepScroll(CONFIG.SCROLL_SETTLE_MS);
-      steps++;
-
-      let fresh = harvestNew(seen, useScroller);
-      if (window.__relayWatchdog) window.__relayWatchdog.beat();
-      if (fresh.length) collected = fresh.concat(collected);   // ← true chronological order
-      trace('up step', steps, 'top=' + Math.round(useScroller.scrollTop),
-            'h=' + useScroller.scrollHeight, 'fresh=' + fresh.length, 'total=' + collected.length);
-
-      const heightBefore = useScroller.scrollHeight;
-      const grew = heightBefore !== lastHeight;
-      const atZero = useScroller.scrollTop <= 2;
-      lastHeight = heightBefore;
-
-      if (onProgress) onProgress(collected.length, steps, useScroller.scrollTop);
-      trace('   top=' + Math.round(useScroller.scrollTop), 'h=' + heightBefore,
-            'grew=' + grew, 'fresh=' + fresh.length, 'idle=' + idleAtTop);
-
-      // Stall guard: Instagram sometimes stops changing scrollTop (rubber-banding,
-      // a modal, an overlay). Without this the loop simply spins until the outer
-      // time limit and looks like a hang.
-      if (!fresh.length && !grew) {
-        if (++stallNoMove >= 6) {
-          WARN('backfill: scroll position stopped moving — stopping here');
-          break;
-        }
-      } else {
-        stallNoMove = 0;
-      }
-
-      // Still walking upward — keep going.
-      if (!atZero) { idleAtTop = 0; continue; }
-
-      // We are at scrollTop 0. That is NOT necessarily the first message: the
-      // transcript lazy-loads older history. Poke it and see if anything appears.
-      if (fresh.length) { idleAtTop = 0; continue; }
-
-      await nudgeForMore(useScroller);
-      const more = harvestNew(seen, useScroller);
-      const heightAfter = useScroller.scrollHeight;
-
-      if (more.length) collected = more.concat(collected);
-
-      const loadedMore = heightAfter > heightBefore + 4 || more.length > 0;
-      if (loadedMore) {
-        idleAtTop = 0;
-        lastHeight = heightAfter;
-        trace('   lazy-loaded more; h=' + heightAfter + ' fresh=' + more.length);
-        continue;                       // new rows rendered → keep going up
-      }
-
-      idleAtTop++;
-      trace('   nothing more at top (idle=' + idleAtTop + ')');
-      if (idleAtTop > CONFIG.SCROLL_TOP_GRACE) {
-        trace('   reached the real top');
-        break;
-      }
-      await sleepScroll(250);
-    }
-
-    // ── Order ────────────────────────────────────────────────────────────────
-    // `collected` holds every SIGHTING of every message (the same bubble is seen
-    // on several upward steps), so it must be collapsed by signature — keeping at
-    // most `maxPerSig` copies, since "ok" can legitimately be sent twice.
-    // `collected` was built by PREPENDING each step, so it is already in chat
-    // order oldest → newest. (An older version also ran a second full top→bottom
-    // pass here to rebuild that order; on a long thread that doubled the work and
-    // looked like a hang.)
-    const finalList = dedupeOrdered(collected, seen.maxPerSig);
-    useScroller.scrollTop = origTop > 0 ? origTop : useScroller.scrollHeight;
-
-    LOG('backfill order:', finalList.length, 'messages (steps', steps + ')');
-    trace('collected=' + collected.length + ' final=' + finalList.length);
-    return finalList;
-  }
-
-  /**
-   * Collapse the canonical pass result.
-   *
-   * The pass walks strictly top→bottom and only adds bubbles it has not seen at
-   * that exact scroll offset, so genuine repeats ("ok" sent twice) stay separate.
-   * All this needs to do is drop runs that were re-harvested without movement.
-   */
-  function dedupeSequential(list) {
-    const out = [];
-    let prevId = null;
-    for (const item of list) {
-      const id = item.sig + '@' + (item.offsetKey ?? '');
-      if (id === prevId) continue;
-      prevId = id;
-      out.push(item);
-    }
-    return out;
-  }
-
-  /**
-   * Collapse the collected list into true chat order.
-   *
-   * `collected` holds every sighting during the scroll; the same bubble is often
-   * seen on several steps. We keep at most `maxPerSig` copies of each signature
-   * (so a message genuinely sent twice survives), ordered by its top-most
-   * recorded position.
-   */
-  function dedupeOrdered(list, maxPerSig) {
-    const bySig = new Map();
-    for (const item of list) {
-      const arr = bySig.get(item.sig) || [];
-      arr.push(item);
-      bySig.set(item.sig, arr);
-    }
-
-    const out = [];
-    for (const [sig, arr] of bySig) {
-      arr.sort((a, b) => (a.contentY ?? 0) - (b.contentY ?? 0));
-      const limit = Math.max(1, (maxPerSig && maxPerSig.get(sig)) || 1);
-      // take the top-most `limit` sightings, keeping their relative order
-      out.push(...arr.slice(0, limit));
-    }
-
-    out.sort((a, b) => (a.contentY ?? 0) - (b.contentY ?? 0));
-    return out;
-  }
-
-  /* ===================================================================================
-   * 8. MAIN SCAN LOOP
-   * =================================================================================== */
-
-  async function scan() {
-    if (!STATE.ready || STATE.scanning) return;
-    if (CONFIG.PAUSE_WHEN_HIDDEN && document.hidden) return;   // Android froze us
-
-    const id = chatIdFromUrl();
-    if (!id || id !== String(CONFIG.TARGET_CHAT_ID)) {
-      if (!STATE.paused) { STATE.paused = true; LOG('paused — not the target thread'); }
-      hud('⏸ Relay paused · open the target chat', 'warn');
+      STATE.maxSeq = Math.max(STATE.maxSeq, n - 1);
+      STATE.minSeq = Math.min(STATE.minSeq, 0);
+      LOG('positions: batch anchored at 0..' + (n - 1));
       return;
     }
+    // messages with no position yet were reached by scrolling ABOVE what we know
+    const fresh = todo.filter((it) => !STATE.posSeq.has(it.sig));
+    let minSeq = STATE.minSeq;
+    for (let i = fresh.length - 1; i >= 0; i--) {
+      STATE.posSeq.set(fresh[i].sig, --minSeq);
+    }
+    STATE.minSeq = minSeq;
+    if (fresh.length) VLOG('assigned', fresh.length, 'positions from', minSeq);
+  }
 
-    // A history read owns the conversation while it runs: its own pointers, its
-    // own seen-sets. Syncing on top of it is what duplicated rows (104 for 36).
-    // Keep standing down for a moment AFTER it finishes, because it leaves the
-    // transcript parked at the oldest message.
-    if (backfillLock || STATE.inManualBackfill) return;
-    if (STATE.holdScansUntil && nowMs() < STATE.holdScansUntil) return;
+  function missingOnScreen() {
+    let bubbles;
+    try { bubbles = getBubbles().bubbles; } catch (_) { return []; }
+    const out = [];
+    const planned = new Map();     // sig -> how many we are about to write
 
-    STATE.scanning = true;
-    STATE.paused = false;
-    STATE.lastScanAt = nowMs();
+    for (const b of bubbles) {
+      let item;
+      try { item = extractRow(b); } catch (_) { continue; }
+      if (!item) continue;
+      if (isJunkItem(item)) continue;
+      if (!item.text && item.kind === 'text') continue;
 
+      const have = (STATE.sigCounts.get(item.sig) || 0) + (STATE.seenThisSession.get(item.sig) || 0);
+      const taking = planned.get(item.sig) || 0;
+      if (taking < have) { planned.set(item.sig, taking + 1); continue; }  // already saved copy
+
+      planned.set(item.sig, taking + 1);
+      out.push(item);
+    }
+    return out;
+  }
+
+  async function savePass() {
+    if (STATE.writeLock) return;
+    STATE.writeLock = true;
     try {
-      // ── full-history backfill, once, when the database is empty ──────────────
-      // Automatic full-history read: only when the DB is genuinely empty, and
-      // only ONCE per page load. If it comes back empty we stop trying, so the
-      // relay can never sit in a silent backfill loop — the ⬆ button is the
-      // explicit way to ask again.
-      if (CONFIG.BACKFILL && !STATE.backfilled && !STATE.inManualBackfill && STATE.tail.length === 0) {
-        STATE.backfilled = true;
-        const saved = await runBackfill();
+      const todo = missingOnScreen();
+      STATE.lastRows = todo.length;
+      if (!todo.length) {
+        hud('✅ All caught up · ' + STATE.wrote + ' saved', 'ok');
+        return;
+      }
+
+      // Remember where this batch begins. You scroll upward, so a later batch is
+      // always OLDER than the previous one — but only if the view actually moved.
+      const batchTop = { sig: todo[0].sig, key: todo[0].sig + '@' + todo[0].side };
+      const continuingUp = STATE.frontLine && STATE.frontLineKey !== batchTop.key;
+
+      // If the database is empty this is the FIRST batch. Whether it covers the
+      // oldest message decides the direction for the whole session.
+      const dbEmptyAtStart = STATE.sigCounts.size === 0;
+
+      // ── Chat position, BEFORE writing ────────────────────────────────────────
+      // Numbering is anchored on the FIRST batch of the session: that is the
+      // oldest range reached so far, so it gets 0..n-1. Batches you scroll up to
+      // later are older still, so they take negative positions. Nothing already
+      // stored is ever renumbered.
+      assignPositions(todo);
+
+      for (let i = 0; i < todo.length; i++) {
+        if (!STATE.running) break;                     // ⏸ respected mid-batch
+        if (CONFIG.PAUSE_WHEN_HIDDEN && document.hidden) break;
+
+        const item = todo[i];
+        let saved = false;
+        let lastErr = '';
+        for (let a = 1; a <= CONFIG.MAX_ATTEMPTS && !saved; a++) {
+          try {
+            await pushItem(item);
+            saved = true;
+          } catch (e) {
+            lastErr = e.message;
+            STATE.lastError = e.message;
+            await sleep(200 * a);
+          }
+        }
+
         if (!saved) {
-          hud('⏳ Nothing saved yet · tap ⬆ button to read from the first message', 'warn');
+          // Honest placeholder: the message existed but could not be obtained.
+          try {
+            const label = {
+              photo: '⚠️ Can\'t load this photo!',
+              reel: '⚠️ Can\'t load this reel!',
+              voice: '⚠️ Can\'t load this audio!',
+              video: '⚠️ Can\'t load this video!',
+              file: '⚠️ Can\'t load this file!',
+              text: '⚠️ Can\'t load this message!',
+            }[item.kind] || '⚠️ Can\'t load this message!';
+            const payload = {
+              side: item.side,
+              kind: item.kind,
+              text: item.text || '',
+              ts: nowMs(),
+              sig: item.sig + ':failed',
+              author: item.side === 'me' ? 'Orin' : 'MD.Soad',
+              failed: label,
+            };
+            if (item.reel) payload.reel = item.reel;
+            const res = await fbRequest('POST', '.json', payload);
+            const key = res && res.name;
+            if (key) {
+              STATE.tail.push({ key, sig: payload.sig });
+              STATE.sigCounts.set(payload.sig, (STATE.sigCounts.get(payload.sig) || 0) + 1);
+              STATE.seenThisSession.set(payload.sig, (STATE.seenThisSession.get(payload.sig) || 0) + 1);
+              noteSaved(item.sig);          // the message IS recorded, mark it
+              STATE.wrote++;
+            }
+          } catch (e) {
+            WARN('placeholder save failed', e.message);
+            STATE.lastError = 'save failed: ' + (lastErr || e.message);
+          }
         }
-        return;
-      }
 
-      const { bubbles } = getBubbles();
-      STATE.lastRows = bubbles.length;
-      if (!bubbles.length) {
-        reportStarved();
-        return;
-      }
-
-      const items = bubbles.map(extractRow).filter((i) => !isJunkItem(i));
-      if (!items.length) {
-        reportStarved();
-        return;
-      }
-      STATE.starvedSince = 0;
-      await syncItems(items);
-
-    } catch (e) {
-      WARN('scan error', e);
-      STATE.lastError = e.message;
-      hud('⚠️ Relay error · tap for details', 'bad');
-      if (!panelEl) buildPanel();
-      panelEl.style.display = 'block';
-      renderPanel();
-    } finally {
-      STATE.scanning = false;
-    }
-  }
-
-  /**
-   * Shown when nothing was detected. Instead of a dead-end "waiting" pill it
-   * states WHY, so the fix is obvious from the badge alone.
-   */
-  function reportStarved() {
-    STATE.starvedSince = STATE.starvedSince || nowMs();
-    const waited = Math.round((nowMs() - STATE.starvedSince) / 1000);
-    const sc = findThreadScroller();
-    const composer = findComposer();
-    let why;
-    if (!composer) why = 'no message box found — open the chat itself';
-    else if (!sc) why = 'no conversation panel found — try Desktop site';
-    else {
-      const region = sc.querySelectorAll('[dir="auto"], img, video, audio').length;
-      why = region
-        ? 'found ' + region + ' items but none looked like a message'
-        : 'the conversation panel is empty — scroll up a little';
-    }
-    hud('⏳ Waiting (' + waited + 's) · ' + why, 'warn');
-  }
-
-  /**
-   * Only one history read may run at a time. Two concurrent backfills share the
-   * same `seen` sets and the same Firebase tail, which produced duplicated and
-   * out-of-order rows (86 rows for 36 messages). Everything that can start a
-   * read goes through this lock.
-   */
-  let backfillLock = null;
-
-  /**
-   * If a long read stops publishing progress for this long, something is stuck
-   * (a blocked scroll, a modal, Instagram throttling the tab). Abort and say so
-   * rather than leaving "Reading history…" on screen forever.
-   */
-  const READ_STALL_MS = 45000;
-
-  function makeWatchdog(onStall) {
-    const wd = {
-      last: nowMs(),
-      fired: false,
-      beat() { wd.last = nowMs(); },
-      get stalled() { return nowMs() - wd.last > READ_STALL_MS; },
-      check() {
-        if (!wd.fired && wd.stalled) { wd.fired = true; onStall(); }
-        return wd.fired;
-      },
-    };
-    return wd;
-  }
-
-  async function withBackfillLock(fn) {
-    while (backfillLock) {
-      try { await backfillLock; } catch (_) {}
-    }
-    let release;
-    backfillLock = new Promise((r) => { release = r; });
-    try {
-      return await fn();
-    } finally {
-      release();
-      backfillLock = null;
-    }
-  }
-
-  /** Scroll the whole conversation once, then push everything in chat order. */
-  async function runBackfill() {
-    return withBackfillLock(() => runBackfillLocked());
-  }
-
-  async function runBackfillLocked() {
-    if (document.hidden) { STATE.backfilled = false; return 0; }
-    if (window.__relayWatchdog) window.__relayWatchdog.beat();
-    hud('📜 Reading full history from the top…');
-    let all = null;
-    try {
-      all = await backfillAll((collected, onScreen, step) => {
-        hud('📜 Collecting history… ' + collected + ' messages (step ' + step + ')');
-      });
-    } catch (e) {
-      WARN('backfill failed', e);
-    }
-    if (!all || !all.length) {
-      // Do NOT clear the flag: an automatic retry loop would hide the failure
-      // behind a permanent "reading history" pill. The user gets a button.
-      hud('⚠️ Could not read history · tap ⬆ button', 'bad');
-      return 0;
-    }
-
-    STATE.tail = [];
-    STATE.reactions.clear();
-    STATE.looseDedupe = false;
-
-    hud('⬆️ Saving ' + all.length + ' messages in order…');
-    let n = 0;
-    for (const item of all) {
-      try {
-        await pushItem(item);
-        n++;
-        if (n % 5 === 0) hud('⬆️ Saving history… ' + n + '/' + all.length);
-      } catch (e) {
-        WARN('history push failed', e.message);
-        STATE.lastError = e.message;
-        await sleep(500);
-      }
-      await sleep(CONFIG.POST_DELAY_MS);
-    }
-    STATE.resetPushed = true;
-    LOG('backfill collected', all.length, 'items:',
-        all.slice(0, 6).map((i) => (i.text || i.kind)).join(' | '), '…');
-    if (all.length > 2) {
-      const firstDupes = all.filter((it, i) => i && all[i - 1] && all[i - 1].sig === it.sig).length;
-      if (firstDupes) WARN('backfill: ' + firstDupes + ' adjacent duplicate signatures');
-    }
-    hud('🔴 Live · ' + STATE.wrote + ' relayed', 'ok');
-    LOG('backfill complete:', n, 'messages');
-    return n;
-  }
-
-  /**
-   * Diff the rendered conversation against what is already stored and push only
-   * the new messages, in order.
-   */
-  async function syncItems(items) {
-    const domSigs = items.map((i) => i.sig);
-
-    const looseSlice = () => {
-      const tailSet = new Set(STATE.tail.map((t) => t.sig));
-      let anchor = -1;
-      for (let i = items.length - 1; i >= 0; i--) {
-        if (tailSet.has(domSigs[i])) { anchor = i; break; }
-      }
-      return { start: anchor + 1, k: 0 };
-    };
-
-    let start;
-    let k;
-
-    if (STATE.looseDedupe) {
-      ({ start, k } = looseSlice());
-    } else {
-      const res = align(domSigs, STATE.tail);
-      start = res.start;
-      k = res.k;
-      if (res.behind) {
-        STATE.behindScans++;
-        if (STATE.behindScans < CONFIG.BEHIND_RECOVERY_SCANS) {
-          hud('⏳ Waiting for the thread to catch up…', 'warn');
-          return;
-        }
-        WARN('DOM is behind the database — switching to signature dedupe');
-        STATE.looseDedupe = true;
-        ({ start, k } = looseSlice());
-      }
-    }
-    STATE.behindScans = 0;
-
-    const keyByIndex = new Map();
-    for (let j = 0; j < k; j++) {
-      keyByIndex.set(start + j, STATE.tail[STATE.tail.length - k + j].key);
-    }
-    const fresh = [];
-    for (let i = start + k; i < items.length; i++) fresh.push(items[i]);
-
-    if (fresh.length) {
-      hud('⬆️ Syncing ' + fresh.length + ' new message' + (fresh.length > 1 ? 's' : '') + '…');
-      for (const item of fresh) {
-        try {
-          await pushItem(item);
-        } catch (e) {
-          WARN('push failed', e.message);
-          STATE.lastError = e.message;
-          await sleep(400);
-        }
+        hud('⬆ Saving ' + (i + 1) + '/' + todo.length + ' · ' + STATE.wrote + ' done');
         await sleep(CONFIG.POST_DELAY_MS);
       }
-    }
 
-    // reactions: patch only what changed
-    for (const [idx, key] of keyByIndex.entries()) {
-      const item = items[idx];
-      const next = item.reaction || null;
-      const prev = STATE.reactions.has(key) ? STATE.reactions.get(key) : null;
-      if ((next || null) === (prev || null)) continue;
-      try {
-        await patchReactions(key, next);
-        STATE.reactions.set(key, next);
-        LOG('reaction updated', key, prev, '→', next);
-      } catch (e) {
-        WARN('reaction patch failed', e.message);
-      }
-      await sleep(30);
-    }
+      // A batch that starts with a message we already know is a repeat of the
+      // same screen (nothing scrolled). A batch that starts with a NEW message
+      // while we were already saving means the view jumped down, which would
+      // break chronological order — flag it rather than silently mis-ordering.
+      STATE.frontLine = batchTop.sig;
+      STATE.frontLineKey = batchTop.key;
+      STATE.reversed = !!(STATE.lastFrontLine && STATE.lastFrontLine === batchTop.sig);
+      STATE.lastFrontLine = batchTop.sig;
 
-    hud('🔴 Live · ' + STATE.wrote + ' relayed', 'ok');
+      if (STATE.running) hud('🔴 Saving · ' + STATE.wrote + ' done', 'ok');
+    } finally {
+      STATE.writeLock = false;
+    }
   }
 
   /* ===================================================================================
-   * 9. BOOT
+   * 11. REACTIONS on already-saved messages
+   * =================================================================================== */
+
+  async function syncReactions() {
+    if (!STATE.tail.length) return;
+    const bubbles = (() => { try { return getBubbles().bubbles; } catch (_) { return []; } })();
+    if (!bubbles.length) return;
+
+    const keyBySig = new Map();
+    STATE.tail.forEach(({ key, sig }) => { if (sig) keyBySig.set(sig, key); });
+
+    for (const b of bubbles) {
+      let item;
+      try { item = extractRow(b); } catch (_) { continue; }
+      const key = keyBySig.get(item.sig);
+      if (!key) continue;
+      const current = STATE.reactions.get(key) || null;
+      if ((item.reaction || null) === current) continue;
+      try {
+        await patchReactions(key, item.reaction);
+        LOG('reaction updated', key, current, '→', item.reaction);
+      } catch (_) { /* non-fatal */ }
+    }
+  }
+
+  /* ===================================================================================
+   * 12. MAIN LOOP (ticks only while ▶ is pressed)
    * =================================================================================== */
 
   let bootAttempts = 0;
 
+  async function tick() {
+    if (STATE.scanning || STATE.writeLock) return;
+    if (!STATE.ready || !STATE.running) return;
+    if (CONFIG.PAUSE_WHEN_HIDDEN && document.hidden) return;
+
+    const s = currentState();
+    if (s.code === 'wrong-thread' || s.code === 'no-thread') {
+      hud('⏸ ' + s.hint, 'warn');
+      return;
+    }
+
+    STATE.scanning = true;
+    STATE.lastScanAt = nowMs();
+    try {
+      await savePass();
+      await syncReactions();
+      scheduleMarks();
+    } catch (e) {
+      WARN('tick error', e);
+      STATE.lastError = e.message;
+      hud('⚠️ ' + e.message.slice(0, 48), 'bad');
+    } finally {
+      STATE.scanning = false;
+      paintButton();
+    }
+  }
+
+  function toggleRunning() {
+    const s = currentState();
+    if (s.code === 'no-thread' || s.code === 'wrong-thread') {
+      hud('⏸ ' + s.hint, 'warn');
+      return;
+    }
+    if (s.code === 'connecting') {
+      hud('⏳ Still loading the database index…', 'warn');
+      return;
+    }
+    STATE.running = !STATE.running;
+    paintButton();
+    if (STATE.running) {
+      hud('🔴 Saving · press ⏸ to stop', 'ok');
+      tick();
+    } else {
+      hud('⏸ Paused · nothing is being saved');
+    }
+  }
+
+  /* ===================================================================================
+   * 13. BOOT
+   * =================================================================================== */
+
   function configProblems() {
-    const problems = [];
-    if (/YOUR-PROJECT-ID/.test(DB)) problems.push('FIREBASE_DB_URL still says YOUR-PROJECT-ID');
-    else if (!/^https?:\/\//i.test(DB)) problems.push('FIREBASE_DB_URL must start with https://');
-    else if (!/firebaseio\.com|firebasedatabase\.app/.test(DB)) problems.push('FIREBASE_DB_URL is not a Firebase host');
-    if (/YOUR_THREAD_ID/.test(String(CONFIG.TARGET_CHAT_ID))) problems.push('TARGET_CHAT_ID still says YOUR_THREAD_ID');
-    return problems;
+    const out = [];
+    if (!/^https?:\/\//i.test(CONFIG.FIREBASE_DB_URL)) out.push('FIREBASE_DB_URL is not a URL');
+    if (/YOUR-PROJECT-ID/.test(CONFIG.FIREBASE_DB_URL)) out.push('FIREBASE_DB_URL has a placeholder');
+    if (/YOUR_THREAD_ID/.test(String(CONFIG.TARGET_CHAT_ID))) out.push('TARGET_CHAT_ID has a placeholder');
+    return out;
   }
 
   function boot() {
+    ensureStartButton();
     ensureHud();
     bootAttempts++;
 
     const problems = configProblems();
     if (problems.length) {
-      WARN('config problems:', problems.join(' · '));
-      hud('⚠️ Setup needed · tap for details', 'bad');
-      if (!panelEl) buildPanel();
-      panelEl.style.display = 'block';
-      renderPanel();
+      hud('⚠️ Setup needed', 'bad');
+      LOG('config problems:', problems.join(' · '));
       return;
     }
 
-    hud('🔄 Connecting to Firebase… (attempt ' + bootAttempts + ')');
+    hud('⏳ Connecting…');
 
-    loadTail()
+    loadIndex()
       .then(() => {
         STATE.ready = true;
         STATE.lastError = '';
-        LOG('ready for thread', CONFIG.TARGET_CHAT_ID, '· transport:', STATE.transport);
-        hud('🔴 Live · 0 relayed', 'ok');
-        scan();
+        STATE.running = CONFIG.START_RUNNING;
+        paintButton();
+        hud(STATE.running ? '🔴 Saving · press ⏸ to stop' : '⏸ Paused · scroll up and press ▶', 'ok');
+        LOG('ready ·', STATE.tail.length, 'rows indexed');
+        scheduleMarks();
       })
       .catch((e) => {
-        WARN('could not load Firebase:', e.message);
+        WARN('could not load Firebase index:', e.message);
         STATE.lastError = e.message;
-        const diag = classify();
-        // Show the *reason* on screen — essential on a phone with no console.
-        hud('⚠️ ' + (diag ? diag.title : 'Firebase unreachable') + ' · tap', 'bad');
-        if (!panelEl) buildPanel();
+        hud('⚠️ Database unreachable · tap', 'bad');
+        buildPanel();
         panelEl.style.display = 'block';
         renderPanel();
-        // retry with a gentle backoff, but never push until we know what exists
-        const wait = Math.min(60000, 5000 * bootAttempts);
-        setTimeout(boot, wait);
       });
 
-    // ── schedulers ───────────────────────────────────────────────────────────────
-    setInterval(scan, CONFIG.SCAN_INTERVAL_MS);
+    // periodic tick, only meaningful while running
+    setInterval(tick, CONFIG.SCAN_INTERVAL_MS);
 
+    // new messages arriving while running
     let t = null;
     const obs = new MutationObserver(() => {
+      if (!STATE.running) return;
       if (t) return;
-      t = setTimeout(() => { t = null; if (STATE.ready) scan(); }, 450);
+      t = setTimeout(() => { t = null; tick(); }, 500);
     });
     obs.observe(document.body, { childList: true, subtree: true, characterData: true });
 
-    // Instagram is an SPA — re-evaluate pause state on navigation.
+    // keep the ✅ marks glued to the right bubbles while scrolling
+    const onScroll = () => scheduleMarks();
+    document.addEventListener('scroll', onScroll, { capture: true, passive: true });
+    window.addEventListener('resize', onScroll);
+
+    // repaint the button when the route changes (Instagram is an SPA)
     let lastPath = location.pathname;
     setInterval(() => {
       if (location.pathname !== lastPath) {
         lastPath = location.pathname;
-        setTimeout(scan, 800);
+        paintButton();
+        setTimeout(() => { scheduleMarks(); if (STATE.running) tick(); }, 700);
       }
-    }, 600);
+    }, 700);
 
-    // Android: catch up the moment the tab comes back to the foreground.
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && STATE.ready) {
-        VLOG('tab visible again — catching up');
-        scan();
-      }
+      if (!document.hidden && STATE.ready && STATE.running) tick();
     });
-    window.addEventListener('focus', () => { if (STATE.ready) scan(); });
-    window.addEventListener('online', () => { if (STATE.ready) scan(); });
   }
 
-  /* ── Debug handle ─────────────────────────────────────────────────────────
-   * Lets you (and me) inspect detection from the phone's console or via
-   * `copy(JSON.stringify(__relayDebug.snapshot()))`. Harmless to leave in. */
+  /* ── Debug handle ───────────────────────────────────────────────────────── */
   try {
     window.__relayDebug = {
       version: VERSION,
       scroller: () => findThreadScroller(),
-      composer: () => findComposer(),
-      rows: () => findMessageRows(findThreadScroller()),
       bubbles: () => getBubbles().bubbles,
+      items: () => getBubbles().bubbles.map((b) => {
+        try { const i = extractRow(b); return { kind: i.kind, side: i.side, text: i.text, sig: i.sig }; }
+        catch (e) { return { error: e.message }; }
+      }),
+      missing: () => missingOnScreen().map((i) => ({ kind: i.kind, text: i.text })),
+      report: () => pageReport(),
+      stateSigs: () => ({ count: STATE.sigCounts.size, sigs: Array.from(STATE.sigCounts.keys()).slice(0, 20) }),
       snapshot() {
         const sc = findThreadScroller();
-        const rows = findMessageRows(sc);
+        const items = this.items();
         return {
           version: VERSION,
           url: location.pathname,
-          thread: chatIdFromUrl(),
-          target: CONFIG.TARGET_CHAT_ID,
+          running: STATE.running,
+          ready: STATE.ready,
           composer: !!findComposer(),
           scroller: sc ? {
-            tag: sc.tagName,
-            role: sc.getAttribute('role'),
-            label: sc.getAttribute('aria-label'),
-            h: sc.scrollHeight, ch: sc.clientHeight,
-            scrollable: sc.scrollHeight > sc.clientHeight + 12,
+            h: sc.scrollHeight, ch: sc.clientHeight, top: Math.round(sc.scrollTop),
+            kids: sc.children.length, debug: sc.__relayDebug,
           } : null,
-          rowsFound: rows.length,
-          bubblesFound: getBubbles().bubbles.length,
-          firstTexts: rows.slice(0, 4).map((r) => (r.innerText || '').trim().slice(0, 40)),
-          listboxes: Array.from(document.querySelectorAll('[role="listbox"]')).map((e) => ({
-            label: e.getAttribute('aria-label'), kids: e.children.length,
-            h: e.scrollHeight, ch: e.clientHeight,
-          })),
-          state: { ready: STATE.ready, paused: STATE.paused, wrote: STATE.wrote, transport: STATE.transport },
+          bubbles: items.length,
+          items: items.slice(0, 12),
+          missing: this.missing().length,
+          savedThisSession: STATE.wrote,
+          inDb: STATE.tail.length,
+          lastError: STATE.lastError,
         };
       },
     };

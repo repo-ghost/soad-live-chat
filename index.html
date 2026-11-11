@@ -625,6 +625,7 @@
   const ribbon = document.getElementById("demoRibbon");
 
   const els = new Map();        // key -> { wrap, bubble, rx, data }
+  let pendingHistory = false;
 
   /**
    * Avatar fallback chain: soad-pfp.jpg → orin-pfp.jpg → initials circle.
@@ -720,6 +721,15 @@
     bubble.className = "bubble";
     bubble.innerHTML = "";
 
+    // The relay refused to invent content for something it could not save.
+    // Show the honest placeholder instead of an empty bubble.
+    if (m.failed){
+      const wrap = el("div", "bubble media");
+      wrap.appendChild(el("div", "caption",
+        '<span style="opacity:.8">⚠️ ' + escapeHtml(m.failed) + '</span>'));
+      return wrap;
+    }
+
     if (kind === "photo"){
       const src = m.img || m.imgUrl;
       const wrap = el("div", "bubble media");
@@ -796,8 +806,45 @@
 
   let lastSender = null;
 
+  /**
+   * Messages carry `seq` = their true position in the chat (0 = oldest).
+   *
+   * The newest message is saved first and older ones arrive later, so naive
+   * appending placed history backwards. When a message belongs BEFORE something
+   * already on screen, it is inserted at the right spot — the live stream stays
+   * correct and history back-fills into place.
+   */
+  const seqOf = new Map();       // key -> seq
+
+  /** Called once the first live snapshot has landed (keeps the empty state honest). */
+  function noteHistoryArrived(){ pendingHistory = true; }
+
+  /**
+   * Insert-before anchor for a message with a known chat position, or null to
+   * append. Messages without `seq` (old rows written before v3) are skipped so a
+   * mixed database still renders in a sensible order.
+   */
+  function insertionTarget(seq){
+    if (seq == null) return null;
+    let bestSeq = Infinity, bestWrap = null;
+    for (const [k, v] of els) {
+      const s = seqOf.get(k);
+      if (s == null) continue;
+      if (s > seq && s < bestSeq) { bestSeq = s; bestWrap = v.wrap; }
+    }
+    return bestWrap;
+  }
+
+  // test hook (harmless): lets the harness verify ordering without a database
+  window.__viewerTest = { renderMessage, insertionTarget, seqOf, els };
+
   function renderMessage(key, m){
-    ensureDayDivider(m.ts);
+    if (m.seq != null) seqOf.set(key, m.seq);
+    const target = insertionTarget(m.seq);
+    const isHistory = !!target;
+
+    // day dividers only make sense for messages appended in order
+    if (!isHistory) ensureDayDivider(m.ts);
 
     const wrap = el("div", "msg " + (m.side === "me" ? "me" : "friend"));
     wrap.dataset.key = key;
@@ -828,11 +875,12 @@
     stack.appendChild(el("div", "time", fmtTime(m.ts)));
     wrap.appendChild(stack);
 
-    stream.appendChild(wrap);
+    if (target && target.parentElement === stream) stream.insertBefore(wrap, target);
+    else stream.appendChild(wrap);
     els.set(key, { wrap, content, rx });
 
     applyReaction(key, m.reactions);
-    scrollToBottom(true);
+    if (!isHistory) scrollToBottom(true);      // never yank the view for history
   }
 
   function applyReaction(key, value){
